@@ -137,6 +137,7 @@ class TTLCache {
     return e.val;
   }
   set(key, val) { this._store.set(key, { val, exp: Date.now() + this._ttl }); }
+  delete(key)   { this._store.delete(key); }
 }
 
 const recCache    = new TTLCache(12 * 60 * 60 * 1000, "rec");    // 12h
@@ -150,6 +151,58 @@ function predCacheKey(storeId, storeProductId, priceRounded, currency) {
   return `pred:${storeId}:${storeProductId}:${priceRounded}:${currency}`;
 }
 const chatCache   = new TTLCache(10 * 60 * 1000,      "chat");   // 10min
+const embCache    = new TTLCache(24 * 60 * 60 * 1000, "emb");    // 24h — in-memory title→vector cache
+
+// ============================================================
+//  EMBEDDING — gemini-embedding-001 via rec key (GEMINI_KEY_REC)
+//  Same model + URL used in backfill_embeddings.mjs.
+//  Results cached 24h in-memory so same title never hits API twice.
+// ============================================================
+const EMBED_MODEL = "gemini-embedding-001";
+const EMBED_DIMS  = 3072;
+
+async function generateEmbedding(title) {
+  if (!title || !title.trim()) return null;
+  const ck = title.trim().slice(0, 200);
+  const hit = embCache.get(ck);
+  if (hit) return hit;
+  const apiKey = _keys.rec(); // uses GEMINI_KEY_REC
+  if (!apiKey) return null;
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: `models/${EMBED_MODEL}`, content: { parts: [{ text: title.trim() }] } }),
+        signal: AbortSignal.timeout(10000)
+      }
+    );
+    if (!res.ok) { console.warn(`[embed] ${res.status} "${title.slice(0,40)}"`); return null; }
+    const json = await res.json();
+    const values = json?.embedding?.values;
+    if (!Array.isArray(values) || values.length !== EMBED_DIMS) { console.warn(`[embed] bad dims: ${values?.length}`); return null; }
+    embCache.set(ck, values);
+    return values;
+  } catch (e) { console.warn(`[embed] error: ${e.message}`); return null; }
+}
+
+// Called async after every store_listings upsert — never blocks response.
+// Only embeds if the row doesn't have one yet, so safe to call every time.
+async function autoEmbedListing(storeId, storeProductId, title) {
+  if (!title || !title.trim()) return;
+  try {
+    const { data: row } = await supabase
+      .from("store_listings").select("embedding")
+      .eq("store_id", storeId).eq("store_product_id", storeProductId).maybeSingle();
+    if (row?.embedding) return; // already embedded
+    const embedding = await generateEmbedding(title);
+    if (!embedding) return;
+    await supabase.from("store_listings").update({ embedding })
+      .eq("store_id", storeId).eq("store_product_id", storeProductId);
+    console.log(`[embed] auto-embedded ${storeId}/${storeProductId} "${title.slice(0,45)}"`);
+  } catch (e) { console.warn(`[embed] autoEmbed fail: ${e.message}`); }
+}
 
 function recCacheKey(productId, price)             { return `rec:${productId}:${Math.round(price * 100)}`; }
 function detectCacheKey(pid, wasP, curP)           { return `det:${pid}:${Math.round(wasP*100)}:${Math.round(curP*100)}`; }
@@ -596,225 +649,371 @@ function buildFakeDealExplanation(verdictKey, fakeDealScore, cur, was, currency,
 }
 
 // ── 5. Main analyseDeal pipeline v2 ─────────────────────────────
-async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, storeProductId, historyPrices, peerPrices }) {
+async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, storeProductId,
+    historyRows, historyPrices, peerPrices, reanalyze = false }) {
   const cur  = Number(currentPrice);
   const was  = Number(wasPrice);
   const curr = currency || 'USD';
+  const fmt  = p => moneyFmt(curr, p);
+  const VALID_FROM = new Date('2025-02-25T00:00:00Z'); // only trust obs from this date onward
 
-  // ── Step 1: No-discount fast path ─────────────────────────────
+  // ── No-discount fast path ─────────────────────────────────────
   if (!was || !Number.isFinite(was) || was <= cur) {
-    const nd = { verdictKey: 'no_discount', fakeDealScore: 0, confidenceScore: 100,
+    return {
+      verdictKey: 'no_discount', fakeDealScore: 0, confidenceScore: 100,
       explanation: 'No discount detected on this page.',
       verdict: '— No Discount', confidence: 'N/A', message: 'No discount detected on this page.',
-      stats: { refMedian: null, refP25: null, refP75: null, mad: null, modifiedZCurrent: null, modifiedZWas: null, sourceUsed: 'none' },
+      stats: { refMedian: null, refP25: null, refP75: null, mad: null,
+               modifiedZCurrent: null, modifiedZWas: null, sourceUsed: 'none' },
       evidence: { historyCount: 0, peerCount: 0, serpCount: 0 },
-      refs: [], debugReasons: ['no_discount_trigger'], source: 'heuristic', marketMedian: null, marketCount: 0, serpRefs: [] };
-    console.log('[fake-deal:debug]', JSON.stringify({ titleShort: title.slice(0,50), currentPrice: cur, wasPrice: was, verdictKey: 'no_discount', fakeDealScore: 0, confidenceScore: 100, historyCount: 0, peerCount: 0, serpCount: 0, sourceUsed: 'none' }));
-    return nd;
+      refs: [], debugReasons: ['no_discount_trigger'], source: 'heuristic',
+      marketMedian: null, marketCount: 0, serpRefs: [],
+    };
   }
 
-  // ── Step 2: Clean internal evidence ───────────────────────────
-  // historyPrices = price observations for this exact product
-  // peerPrices    = bestDeals only (strict identity matches from computeDealsForProduct)
-  const hist  = (historyPrices || []).filter(n => Number.isFinite(n) && n > 0);
-  const peers = (peerPrices    || []).filter(n => Number.isFinite(n) && n > 0);
-  const histCount = hist.length;
-  const peerCount = peers.length;
-  const internalPrices = [...hist, ...peers];
+  const claimedPct = Math.round((was - cur) / was * 100);
+  const tol        = Math.max(0.5, was * 0.02); // 2% tolerance for price matching
 
-  // ── Step 3: External evidence (SerpAPI) if internal weak ──────
+  // ── Clean inputs ──────────────────────────────────────────────
+  const peers = (peerPrices || []).filter(n => Number.isFinite(n) && n > 0);
+
+  // Valid history = only observations on/after Feb 25 2025
+  const validRows = (historyRows || []).filter(r => {
+    if (!r.observed_at) return false;
+    return new Date(r.observed_at) >= VALID_FROM && Number.isFinite(Number(r.price)) && Number(r.price) > 0;
+  });
+  const validPrices = validRows.map(r => Number(r.price));
+  const histCount   = validRows.length;
+  const peerCount   = peers.length;
+
+  const debugReasons = [];
+  let verdictKey, fakeDealScore, confidenceScore, sourceUsed;
+  let refMedian = null;
+
+  // ════════════════════════════════════════════════════════════
+  //  TIER 1 — Peer consensus (free, independent, current)
+  //  Strongest signal: if market agrees on price, wasPrice is easy to judge
+  // ════════════════════════════════════════════════════════════
+  if (peerCount >= 2) {
+    const sortedPeers = [...peers].sort((a,b) => a - b);
+    const peerMedian  = sortedPeers[Math.floor(sortedPeers.length / 2)];
+    refMedian         = peerMedian;
+    sourceUsed        = 'peers';
+
+    const wasVsPeers = (was - peerMedian) / peerMedian;  // >0 = was above market
+    const curVsPeers = (cur - peerMedian) / peerMedian;  // <0 = cur below market
+
+    debugReasons.push(`peers:${peerCount}`, `peerMedian:${Math.round(peerMedian)}`,
+      `wasVsPeers:${Math.round(wasVsPeers*100)}%`, `curVsPeers:${Math.round(curVsPeers*100)}%`);
+
+    // LIKELY FAKE: wasPrice > 20% above peer median AND current is near market price
+    // e.g. peers all at $199, store says "was $399 now $199" → wasPrice is fabricated
+    if (wasVsPeers > 0.20 && Math.abs(curVsPeers) < 0.12) {
+      verdictKey    = 'likely_fake';
+      fakeDealScore = Math.min(95, Math.round(72 + wasVsPeers * 80));
+      confidenceScore = Math.min(90, 55 + peerCount * 6);
+      debugReasons.push('was_inflated_vs_peers_cur_at_market');
+
+    // LIKELY FAKE: wasPrice is massively above peers (>40%) — extreme inflation
+    } else if (wasVsPeers > 0.40) {
+      verdictKey    = 'likely_fake';
+      fakeDealScore = Math.min(98, Math.round(80 + wasVsPeers * 40));
+      confidenceScore = Math.min(88, 50 + peerCount * 5);
+      debugReasons.push('was_extreme_inflation_vs_peers');
+
+    // SUSPICIOUS: wasPrice 10-20% above peers, current near market
+    } else if (wasVsPeers > 0.10 && Math.abs(curVsPeers) < 0.15) {
+      verdictKey    = 'suspicious';
+      fakeDealScore = Math.min(75, Math.round(45 + wasVsPeers * 120));
+      confidenceScore = Math.min(75, 40 + peerCount * 5);
+      debugReasons.push('was_mildly_high_vs_peers');
+
+    // LIKELY REAL: current is meaningfully below peers AND wasPrice aligns with market
+    // e.g. peers at $350, cur at $280, was at $349 → genuine discount
+    } else if (curVsPeers < -0.08 && wasVsPeers <= 0.12) {
+      verdictKey    = 'likely_real';
+      fakeDealScore = Math.max(5, Math.round(18 + curVsPeers * 80));
+      confidenceScore = Math.min(88, 50 + peerCount * 6);
+      debugReasons.push('cur_genuinely_below_market_was_aligns');
+
+    // LIKELY REAL: wasPrice aligns with peers, current near or below market
+    } else if (Math.abs(wasVsPeers) <= 0.10 && curVsPeers <= 0.08) {
+      verdictKey    = 'likely_real';
+      fakeDealScore = Math.round(15 + Math.abs(curVsPeers) * 50);
+      confidenceScore = Math.min(82, 45 + peerCount * 5);
+      debugReasons.push('was_aligns_with_market');
+
+    } else {
+      // Peers exist but mixed — don't declare verdict yet, fall through to tier 2/3
+      verdictKey = null;
+      debugReasons.push('peers_mixed_signal');
+    }
+
+    // If tier 1 gave a clear verdict, return immediately — no API calls needed
+    if (verdictKey) {
+      const explanation = buildFakeDealExplanation(verdictKey, fakeDealScore, cur, was, curr,
+        { refMedian, refP25: null, refP75: null, mad: null,
+          modifiedZCurrent: null, modifiedZWas: null, sourceUsed },
+        0, histCount, peerCount);
+      const confidenceStr = confidenceScore >= 70 ? 'High' : confidenceScore >= 45 ? 'Medium' : 'Low';
+      console.log(`[FakeDeal:T1] peers=${peerCount} peerMedian=${Math.round(peerMedian)} verdict=${verdictKey} score=${fakeDealScore}`);
+      return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
+        explanation, sourceUsed, refMedian, cleanPrices: peers, serpRefs: [], debugReasons,
+        histCount, peerCount, serpCount: 0, cur, was, curr });
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  TIER 2 — Own price history (only if Feb 25 2025+ and dense enough)
+  //  Checks: did wasPrice ever actually hold for ≥14 days?
+  // ════════════════════════════════════════════════════════════
+  if (histCount >= 15) {
+    sourceUsed = 'history';
+
+    // Find observations within 2% tolerance of wasPrice
+    const atWasRows = validRows.filter(r => Math.abs(Number(r.price) - was) <= tol);
+    const atWasPrices = atWasRows.map(r => Number(r.price));
+
+    // Check legitimacy window: was the wasPrice held for ≥14 days?
+    let legitimacyDays = 0;
+    if (atWasRows.length >= 2) {
+      const dates   = atWasRows.map(r => new Date(r.observed_at).getTime()).sort((a,b) => a-b);
+      legitimacyDays = Math.round((dates[dates.length-1] - dates[0]) / 86400000);
+    }
+
+    const neverAtWas     = atWasRows.length === 0;
+    const briefFlash     = atWasRows.length >= 1 && legitimacyDays < 14;
+    const heldLegitimately = atWasRows.length >= 2 && legitimacyDays >= 14;
+
+    debugReasons.push(`hist:${histCount}`, `atWas:${atWasRows.length}`, `legDays:${legitimacyDays}`);
+
+    if (neverAtWas) {
+      // History is dense and wasPrice never appeared — strong fake signal
+      verdictKey      = 'likely_fake';
+      fakeDealScore   = Math.min(90, 65 + Math.min(25, histCount));
+      confidenceScore = Math.min(82, 45 + histCount);
+      refMedian       = refMedian || (validPrices.length ? validPrices.sort((a,b)=>a-b)[Math.floor(validPrices.length/2)] : null);
+      debugReasons.push('hist_dense_never_at_was');
+
+    } else if (briefFlash) {
+      // wasPrice appeared but only briefly — suspicious, possibly a setup
+      verdictKey      = 'suspicious';
+      fakeDealScore   = 60;
+      confidenceScore = 52;
+      refMedian       = refMedian || (validPrices.length ? validPrices.sort((a,b)=>a-b)[Math.floor(validPrices.length/2)] : null);
+      debugReasons.push(`hist_brief_flash_only_${legitimacyDays}d`);
+
+    } else if (heldLegitimately) {
+      // wasPrice was genuinely held for 2+ weeks — real deal
+      verdictKey      = 'likely_real';
+      fakeDealScore   = Math.max(8, 25 - legitimacyDays); // longer held = more genuine
+      confidenceScore = Math.min(85, 50 + Math.min(20, legitimacyDays));
+      refMedian       = refMedian || was;
+      debugReasons.push(`hist_held_${legitimacyDays}d_legitimate`);
+    }
+
+    if (verdictKey) {
+      const explanation = buildFakeDealExplanation(verdictKey, fakeDealScore, cur, was, curr,
+        { refMedian, refP25: null, refP75: null, mad: null,
+          modifiedZCurrent: null, modifiedZWas: null, sourceUsed },
+        0, histCount, peerCount);
+      const confidenceStr = confidenceScore >= 70 ? 'High' : confidenceScore >= 45 ? 'Medium' : 'Low';
+      console.log(`[FakeDeal:T2] hist=${histCount} atWas=${atWasRows.length} legDays=${legitimacyDays} verdict=${verdictKey}`);
+      return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
+        explanation, sourceUsed, refMedian, cleanPrices: validPrices, serpRefs: [], debugReasons,
+        histCount, peerCount, serpCount: 0, cur, was, curr });
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  TIER 3 — Serp + Gemini (fallback for sparse/ambiguous cases)
+  //  Serp always fires here. Gemini only if Serp is still ambiguous.
+  // ════════════════════════════════════════════════════════════
+  sourceUsed = 'serp+internal';
+  debugReasons.push('tier3:serp_gemini');
+
+  // Serp fetch
   let serpRefs  = [];
   let serpCount = 0;
-  if (internalPrices.length < 3) {
-    serpRefs  = await searchMarketPriceSerp(title, curr);
-    serpCount = serpRefs.length;
-  }
-
-  // ── Step 4: Build weighted price pool + compute robust stats ──
-  // Internal history (our DB) is 2× more trusted than external SerpAPI results.
-  // Duplicate each internal price to give it double weight in the median calculation.
-  const serpPrices     = serpRefs.map(r => r.price);
-  const internalWeight = internalPrices.length >= 1 ? [...internalPrices, ...internalPrices] : []; // 2× weight
-  const weightedPrices = internalWeight.length >= 3
-    ? internalWeight                                      // strong internal: use only internal (2× weighted)
-    : [...internalWeight, ...serpPrices];                 // weak internal: blend with serp
-  const allPrices   = weightedPrices.length > 0 ? weightedPrices : [...internalPrices, ...serpPrices];
-  const cleanPrices = allPrices.filter(p => Number.isFinite(p) && p > 0);
-  const sourceUsed  = internalPrices.length >= 3 ? 'internal' : serpCount > 0 ? 'serp+internal' : 'none';
-  const rs          = robustStats(cleanPrices); // MAD + Z-score stats
-
-  // ── Step 5: Modified Z-score for wasPrice + currentPrice ──────
-  let zmWas = null, zmCur = null;
-  if (rs) { zmWas = rs.modZ(was); zmCur = rs.modZ(cur); }
-  let refMedian = rs?.cleanMedian ?? rs?.median ?? null;
-
-  // ── 50% SANITY CHECK — Model Mismatch Guard ─────────────────
-  // If the market median is more than 50% different from wasPrice, the search
-  // almost certainly returned a mismatch (e.g., a $50 case instead of a $119 phone).
-  // In this case DISCARD the market data — it is worse than no data.
-  // This prevents hallucinated market medians from polluting the verdict.
-  let marketDiscarded = false;
-  if (refMedian !== null && Number.isFinite(was) && was > 0) {
-    const marketDiffPct = Math.abs(was - refMedian) / was;
-    if (marketDiffPct > 0.50) {
-      console.log(`[FakeDeal] Was:${was} Market:${refMedian} Diff:${Math.round(marketDiffPct*100)}% → DISCARDED (model_mismatch)`);
-      refMedian      = null;
-      marketDiscarded = true;
+  const SERP_KEY = process.env.SERPAPI_KEY;
+  if (SERP_KEY) {
+    try {
+      serpRefs  = await searchMarketPriceSerp(title, curr);
+      serpCount = serpRefs.length;
+    } catch (e) {
+      console.warn('[FakeDeal:T3] serp error:', e.message);
     }
   }
-  const debugReasons = marketDiscarded ? ['market_discarded_mismatch_50pct'] : [];
 
-  // ── Step 6: Verdict + scores ──────────────────────────────────
-  let verdictKey, fakeDealScore, confidenceScore;
+  // Build combined price pool
+  const serpPrices     = serpRefs.map(r => r.price).filter(n => Number.isFinite(n) && n > 0);
+  const internalPrices = [...validPrices, ...peers];
+  const allPrices      = [...internalPrices, ...serpPrices];
+  const cleanPrices    = allPrices.filter(n => Number.isFinite(n) && n > 0);
 
-  if (!rs || cleanPrices.length === 0 || marketDiscarded) {
-    // No usable reference data — fall back to internal heuristic signals
-    // (also fires when market data was discarded due to 50% mismatch)
-    const pct  = Math.round(((was - cur) / was) * 100);
-    const tol  = Math.max(0.5, was * 0.02);
-    const atWas = hist.filter(p => Math.abs(p - was) <= tol);
-    if (histCount >= 5 && atWas.length === 0) {
-      verdictKey = 'suspicious'; fakeDealScore = 62; confidenceScore = 42;
-      debugReasons.push('hist_5plus_never_at_was');
-    } else if (atWas.length >= 2) {
-      verdictKey = 'likely_real'; fakeDealScore = 14; confidenceScore = 62;
-      debugReasons.push('hist_confirms_was_2plus');
-    } else if (atWas.length === 1) {
-      verdictKey = 'likely_real'; fakeDealScore = 22; confidenceScore = 45;
-      debugReasons.push('hist_confirms_was_1');
-    } else if (pct >= 50) {
-      verdictKey = 'suspicious'; fakeDealScore = 55; confidenceScore = 22;
-      debugReasons.push('large_claim_no_data');
+  // Robust stats
+  const rs = cleanPrices.length >= 2 ? robustStats(cleanPrices) : null;
+  let zmWas = null, zmCur = null;
+  refMedian = rs?.cleanMedian ?? rs?.median ?? null;
+
+  // Discard market data if it's >30% off from wasPrice (likely wrong product)
+  let marketDiscarded = false;
+  if (refMedian !== null && was > 0) {
+    const diff = Math.abs(was - refMedian) / was;
+    if (diff > 0.30) {
+      console.log(`[FakeDeal:T3] market discarded: was=${was} median=${refMedian} diff=${Math.round(diff*100)}%`);
+      refMedian = null;
+      marketDiscarded = true;
+      debugReasons.push('market_discarded_mismatch_30pct');
+    }
+  }
+
+  if (rs) { zmWas = rs.modZ(was); zmCur = rs.modZ(cur); }
+
+  if (!refMedian || marketDiscarded || cleanPrices.length < 2) {
+    // No usable market data — large claim is suspicious, small claim unverifiable
+    if (claimedPct >= 40) {
+      verdictKey = 'suspicious'; fakeDealScore = 58; confidenceScore = 25;
+      debugReasons.push('large_claim_no_market_data');
     } else {
       verdictKey = 'cannot_verify'; fakeDealScore = 30; confidenceScore = 15;
-      debugReasons.push('no_reference_data');
+      debugReasons.push('no_market_data_cannot_verify');
     }
   } else {
-    // We have market reference — compute ratios
-    const wasVsRef = (was - refMedian) / refMedian;  // >0 = was above market
-    const curVsRef = (cur - refMedian) / refMedian;  // <0 = current below market
+    const wasVsRef = (was - refMedian) / refMedian;
+    const curVsRef = (cur - refMedian) / refMedian;
+    debugReasons.push(`wasVsRef:${Math.round(wasVsRef*100)}%`, `curVsRef:${Math.round(curVsRef*100)}%`);
 
-    // LIKELY FAKE: wasPrice > 120% of median AND currentPrice within 10% of median
     if (wasVsRef > 0.20 && Math.abs(curVsRef) < 0.10) {
       fakeDealScore = Math.min(100, Math.round(70 + wasVsRef * 100));
       verdictKey    = 'likely_fake';
-      debugReasons.push(`was_inflated_${Math.round(wasVsRef * 100)}pct_above_ref`, 'cur_at_market_price');
-
-    // SUSPICIOUS: wasPrice 10–20% above median AND current near market
+      debugReasons.push('serp_was_inflated_cur_at_market');
     } else if (wasVsRef > 0.10 && Math.abs(curVsRef) < 0.15) {
       fakeDealScore = Math.min(79, Math.round(48 + wasVsRef * 120));
       verdictKey    = 'suspicious';
-      debugReasons.push(`was_mildly_high_${Math.round(wasVsRef * 100)}pct`);
-
-    // SUSPICIOUS: was inflated but current also above market (both suspect)
+      debugReasons.push('serp_was_mildly_high');
     } else if (wasVsRef > 0.20 && curVsRef > 0.05) {
       fakeDealScore = Math.min(74, Math.round(50 + wasVsRef * 80));
       verdictKey    = 'suspicious';
-      debugReasons.push('was_inflated_cur_also_high');
-
-    // LIKELY REAL: current meaningfully below market AND was price in line
+      debugReasons.push('serp_both_inflated');
     } else if (curVsRef < -0.10 && wasVsRef <= 0.12) {
-      fakeDealScore = Math.max(0, Math.round(20 + curVsRef * 100)); // curVsRef<0 → score decreases
+      fakeDealScore = Math.max(0, Math.round(20 + curVsRef * 100));
       verdictKey    = 'likely_real';
-      debugReasons.push(`cur_below_market_${Math.round(-curVsRef * 100)}pct`);
-
-    // LIKELY REAL: was aligns with market, current at or near market
+      debugReasons.push('serp_cur_below_market');
     } else if (wasVsRef <= 0.10 && curVsRef <= 0.05) {
       fakeDealScore = Math.round(18 + Math.abs(curVsRef) * 60);
       verdictKey    = 'likely_real';
-      debugReasons.push('was_in_line_with_market');
-
-    // CANNOT VERIFY: weak evidence
+      debugReasons.push('serp_was_aligns_market');
     } else if (cleanPrices.length < 3) {
-      fakeDealScore = 38;
-      verdictKey    = 'cannot_verify';
-      debugReasons.push('weak_evidence_lt3_prices');
-
+      fakeDealScore = 38; verdictKey = 'cannot_verify';
+      debugReasons.push('serp_weak_evidence');
     } else {
-      fakeDealScore = 42;
-      verdictKey    = 'suspicious';
-      debugReasons.push('mixed_signals');
+      fakeDealScore = 42; verdictKey = 'suspicious';
+      debugReasons.push('serp_mixed_signals');
     }
 
-    // Confidence = evidence volume + MAD health
-    const evScore  = Math.min(55, (histCount * 6) + (peerCount * 9) + (serpCount * 4));
-    const madPen   = rs.mad === 0 ? -15 : 0;  // all-same prices = less reliable
-    const weakPen  = cleanPrices.length < 3  ? -20 : 0;
+    // Confidence from evidence volume
+    const evScore   = Math.min(55, (histCount * 6) + (peerCount * 9) + (serpCount * 4));
+    const madPen    = rs.mad === 0 ? -15 : 0;
+    const weakPen   = cleanPrices.length < 3 ? -20 : 0;
     confidenceScore = Math.max(10, Math.min(95, 32 + evScore + madPen + weakPen));
-
     if (zmWas !== null) debugReasons.push(`zmWas=${zmWas.toFixed(2)}`);
-    if (zmCur !== null) debugReasons.push(`zmCur=${zmCur.toFixed(2)}`);
   }
 
-  // ── Step 7: Assemble structured output ────────────────────────
-  const stats = {
-    refMedian,
-    refP25:          rs?.p25 ?? null,
-    refP75:          rs?.p75 ?? null,
-    mad:             rs?.mad ?? null,
-    modifiedZCurrent: zmCur,
-    modifiedZWas:    zmWas,
-    sourceUsed,
-    referenceCount:  cleanPrices.length,
-  };
+  // ── Gemini tiebreaker — only for genuinely ambiguous borderline cases ──
+  // Fires when: verdict is suspicious/cannot_verify AND discount is 15-45% AND serp is thin
+  const needsGemini = reanalyze
+    && (verdictKey === 'suspicious' || verdictKey === 'cannot_verify')
+    && claimedPct >= 15 && claimedPct <= 45
+    && serpCount < 3
+    && histCount < 15;
 
-  const explanation = buildFakeDealExplanation(verdictKey, fakeDealScore, cur, was, curr, stats, serpCount, histCount, peerCount);
+  if (needsGemini) {
+    try {
+      const geminiPrompt = `You are a price authenticity expert. Assess whether this discount is genuine.
+
+Product: "${title}"
+Current price: ${fmt(cur)}
+Claimed "was" price: ${fmt(was)} (${claimedPct}% discount)
+${peers.length ? `Market peers (${peers.length} stores): ${peers.map(p=>fmt(p)).join(', ')}` : 'No peer prices available.'}
+${validPrices.length ? `Our price history (${histCount} obs since Feb 2025): ${validPrices.slice(0,8).map(p=>fmt(p)).join(', ')}` : 'No validated price history.'}
+${serpPrices.length ? `Market references (${serpCount} results): median ${fmt(refMedian)}` : 'No market references found.'}
+
+Respond ONLY with JSON: { "verdict": "likely_fake"|"suspicious"|"likely_real"|"cannot_verify", "confidence": 0-100, "reason": "one sentence" }`;
+
+      const raw = await callAI('detect', geminiPrompt, 120);
+      if (raw) {
+        const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+        if (parsed.verdict && ['likely_fake','suspicious','likely_real','cannot_verify'].includes(parsed.verdict)) {
+          verdictKey      = parsed.verdict;
+          confidenceScore = Math.min(80, parsed.confidence || confidenceScore);
+          fakeDealScore   = verdictKey === 'likely_fake' ? 82
+            : verdictKey === 'suspicious' ? 58
+            : verdictKey === 'likely_real' ? 18 : 35;
+          debugReasons.push('gemini_tiebreaker', parsed.reason || '');
+          sourceUsed = 'gemini';
+        }
+      }
+    } catch (e) {
+      console.warn('[FakeDeal:T3] gemini tiebreaker error:', e.message);
+    }
+  }
+
+  const confidenceStr = confidenceScore >= 70 ? 'High' : confidenceScore >= 45 ? 'Medium' : 'Low';
+  const explanation   = buildFakeDealExplanation(verdictKey, fakeDealScore, cur, was, curr,
+    { refMedian, refP25: rs?.p25??null, refP75: rs?.p75??null, mad: rs?.mad??null,
+      modifiedZCurrent: zmCur, modifiedZWas: zmWas, sourceUsed },
+    serpCount, histCount, peerCount);
+
+  console.log(`[FakeDeal:T3] verdict=${verdictKey} score=${fakeDealScore} conf=${confidenceScore} serp=${serpCount} hist=${histCount} peers=${peerCount}`);
+
+  return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
+    explanation, sourceUsed, refMedian, cleanPrices, serpRefs, debugReasons,
+    histCount, peerCount, serpCount, cur, was, curr });
+}
+
+// ── Shared output assembler — keeps both tiers returning identical shape ──
+function _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
+    explanation, sourceUsed, refMedian, cleanPrices, serpRefs, debugReasons,
+    histCount, peerCount, serpCount, cur, was, curr }) {
 
   const VERDICT_DISPLAY = {
-    likely_fake:    '❌ Likely Fake',
-    suspicious:     '⚠️ Suspicious',
-    likely_real:    '✅ Likely Real',
-    cannot_verify:  '🤷 Cannot Verify',
-    no_discount:    '— No Discount',
+    likely_fake:   '❌ Likely Fake',
+    suspicious:    '⚠️ Suspicious',
+    likely_real:   '✅ Likely Real',
+    cannot_verify: '🤷 Cannot Verify',
+    no_discount:   '— No Discount',
   };
 
-  const verdictLabel  = VERDICT_DISPLAY[verdictKey] || '🤷 Unknown';
-  const confidenceStr = confidenceScore >= 70 ? 'High' : confidenceScore >= 45 ? 'Medium' : 'Low';
-
-  // Top refs for UI (prefer cheaper than current price, then sort by price asc)
   const topRefs = [...serpRefs]
-    .sort((a, b) => a.price - b.price)
-    .slice(0, 3)
+    .sort((a,b) => a.price - b.price).slice(0, 3)
     .map(r => ({ source: r.source, price: r.price, url: r.url, title: r.title, condition: r.condition }));
 
-  // Compact required debug log
-  const _mktDiff = refMedian && was ? Math.round(Math.abs(was - refMedian) / was * 100) : null;
-  console.log(`[FakeDeal] Was:${was} | Market:${refMedian ?? 'N/A'} | Diff:${_mktDiff != null ? _mktDiff+'%' : 'N/A'} | Status:${verdictKey}${marketDiscarded ? ' [mismatch_discarded]' : ''}`);
-  console.log('[fake-deal:debug]', JSON.stringify({
-    titleShort:     title.slice(0, 50),
-    currentPrice:   cur,
-    wasPrice:       was,
-    verdictKey,
-    fakeDealScore,
-    confidenceScore,
-    historyCount:   histCount,
-    peerCount,
-    serpCount,
-    sourceUsed,
-    refMedian,
-    marketDiscarded,
-  }));
-
   return {
-    // ── New structured fields ──
     verdictKey,
     fakeDealScore,
     confidenceScore,
     explanation,
-    stats,
-    evidence:    { historyCount: histCount, peerCount, serpCount },
-    refs:        topRefs,
+    stats: {
+      refMedian,
+      refP25: null, refP75: null, mad: null,
+      modifiedZCurrent: null, modifiedZWas: null,
+      sourceUsed,
+    },
+    evidence:     { historyCount: histCount, peerCount, serpCount },
+    refs:         topRefs,
     debugReasons,
-    // ── Legacy fields (backward compat with /v1/observations + content.js) ──
-    verdict:     verdictLabel,
-    confidence:  confidenceStr,
-    message:     explanation,
-    source:      sourceUsed,
+    // Legacy fields
+    verdict:      VERDICT_DISPLAY[verdictKey] || '🤷 Unknown',
+    confidence:   confidenceStr,
+    message:      explanation,
+    source:       sourceUsed,
     marketMedian: refMedian,
     marketCount:  cleanPrices.length,
     serpRefs:     topRefs,
   };
 }
+
 
 // Keep _doAIDetect for queue compat — now just calls analyseDeal
 async function _doAIDetect({ currentPrice, wasPrice, currency, historyPrices, peerPrices, title }) {
@@ -3637,162 +3836,200 @@ function buildRetrievalQueries(title, tax) {
 async function computeDealsForProduct({ storeId, storeProductId, baseTitle, baseCurrency, basePrice, limit = 20 }) {
   const baseTax        = taxonomy(baseTitle);
   const plugin         = getPlugin(baseTax.sub);
-  const queries        = buildRetrievalQueries(baseTitle, baseTax);
   const baseClassified = classifyListingRuntime(baseTitle);
 
-  const { data: stores } = await supabase.from('stores').select('id').neq('id', storeId);
-  const storeIds = (stores || []).map(s => s.id);
-
-  // acceptedSeen: dedup AFTER bucket decision — rejected candidates can be retried in later passes
   const acceptedSeen = new Set();
   const rawBest      = [];
   const rawOther     = [];
 
-  // Debug counters — all 9 required by spec
   const dbg = {
-    retrievedTotal: 0,
-    dedupedTotal: 0,
-    rejectedRole: 0,
-    rejectedPrice: 0,
-    rejectedClassifierLowConfidence: 0,
-    rejectedIntentMismatch: 0,
-    rejectedWeakIdentity: 0,
-    acceptedBestDeals: 0,
-    acceptedOtherModels: 0,
-    // legacy aliases for backward compat with log readers
+    retrievedTotal: 0, dedupedTotal: 0,
+    rejectedRole: 0, rejectedPrice: 0, rejectedClassifierLowConfidence: 0,
+    rejectedIntentMismatch: 0, rejectedWeakIdentity: 0,
+    acceptedBestDeals: 0, acceptedOtherModels: 0,
     retrieved: 0, hardRejected: 0, accepted: 0, bestDeals: 0, otherModels: 0,
+    vectorUsed: false,
   };
 
-  // ── Helper: fetch for one store using OR or AND ilike ──────
-  // retrievalSeen is LOCAL (per fetch call) — prevents duplicate DB rows in a single result set.
-  // It does NOT persist across queries so PASS 3 can return items PASS 1 rejected.
-  async function fetchCandidates(sid, query) {
-    let q = supabase.from('store_listings')
-      .select('store_id,store_product_id,title,page_url,canonical_url')
-      .eq('store_id', sid)
-      .limit(100);
+  // ── Shared scorer — identical logic to old per-store loop ──
+  function scoreAndBucket(cand) {
+    const candClassified = classifyListingRuntime(cand.title);
+    if (candClassified.role !== 'main_product') { dbg.rejectedRole++; dbg.hardRejected++; return; }
 
-    if (query.mode === 'OR' && query.terms.length > 1) {
-      // Sanitize terms: strip %, _, commas which break Supabase .or() syntax
-      const safe = t => t.replace(/[%_,]/g, ' ').trim().replace(/\s+/g,' ');
-      const orClause = query.terms
-        .filter(t => t.trim().length > 0)
-        .map(t => `title.ilike.%${safe(t)}%`)
-        .join(',');
-      if (orClause) q = q.or(orClause);
-    } else {
-      for (const term of query.terms) q = q.ilike('title', `%${term}%`);
+    const candTax = taxonomy(cand.title);
+    if (baseTax.cat !== 'unknown' && candTax.cat !== 'unknown' && baseTax.cat !== candTax.cat) {
+      dbg.rejectedIntentMismatch++; dbg.hardRejected++; return;
     }
 
-    const { data: listings } = await q;
-    console.log(`[fetch] store=${sid} mode=${query.mode} terms=${JSON.stringify(query.terms)} found=${listings?.length||0}`);
-    if (!listings?.length) return [];
+    if (!priceSane(baseTax.sub, cand.price)) { dbg.rejectedPrice++; dbg.hardRejected++; return; }
 
-    const { data: prods } = await supabase.from('products')
-      .select('store_id,store_product_id,last_price,currency')
-      .eq('store_id', sid)
-      .in('store_product_id', listings.map(x => x.store_product_id));
-    if (!prods?.length) return [];
+    let identMatch = 'uncertain', score = 0, label = 'Similar', mTier = 'RELATED';
+    try {
+      identMatch = plugin.identityMatch(baseTitle, cand.title);
+      score      = plugin.score(baseTitle, cand.title);
+      label      = plugin.label(identMatch);
+      mTier      = plugin.matchTier(identMatch);
+    } catch {}
 
-    const pm = new Map(prods.map(p => [`${p.store_id}|${p.store_product_id}`, p]));
-    const localSeen = new Set(); // row-level dedup within this one fetch only
-    const out = [];
-    for (const li of listings) {
-      const key = `${sid}|${li.store_product_id}`;
-      if (localSeen.has(key)) continue;
-      const p = pm.get(key); if (!p) continue;
-      const price = Number(p.last_price);
-      if (!Number.isFinite(price) || price <= 0) continue;
-      localSeen.add(key);
-      dbg.dedupedTotal = (dbg.dedupedTotal||0) + 1;
-      out.push({ storeId: sid, storeProductId: String(li.store_product_id), title: li.title||'', price, currency: p.currency||baseCurrency||'USD', url: li.page_url||li.canonical_url||null });
+    if (candClassified.numericConfidence !== undefined && candClassified.numericConfidence < 25) {
+      dbg.rejectedClassifierLowConfidence++; dbg.hardRejected++; return;
     }
-    return out;
+
+    const { bucket } = decideDealBucket(
+      { baseTitle, basePrice, baseTax, baseClassified },
+      { cand, identMatch, score, candTax, candClassified }
+    );
+    if (bucket === 'DROP') return;
+
+    const acceptKey = `${cand.storeId}|${cand.storeProductId}`;
+    if (acceptedSeen.has(acceptKey)) return;
+    acceptedSeen.add(acceptKey);
+
+    const item = {
+      ...cand,
+      name:       STORE_DISPLAY[cand.storeId] || cand.storeId,
+      matchTier:  mTier,
+      matchLabel: label,
+      condition:  /\bused\b|\brefurbished\b/.test((cand.title||'').toLowerCase()) ? 'used' : 'new',
+      score, bucket, identMatch,
+      candBrand: candClassified.brand,
+    };
+
+    if (bucket === 'BEST_DEALS')        { dbg.acceptedBestDeals++;   rawBest.push(item); }
+    else if (bucket === 'OTHER_MODELS') { dbg.acceptedOtherModels++; rawOther.push(item); }
+    dbg.accepted++;
   }
 
-  // ── Per store: run all queries, collect all candidates ─────
-  for (const sid of storeIds) {
-    const storeCandidates = [];
-    let acceptedForStore = 0;
+  // ── VECTOR RETRIEVAL — one RPC, all stores at once ─────────
+  let vectorWorked = false;
 
-    for (const query of queries) {
-      // Break only if we have >= 6 ACCEPTED candidates for this store
-      // (not just retrieved rows). Weak/noisy PASS 1 should not block PASS 3 broad fallback.
-      if (acceptedForStore >= 6 && query.mode === 'OR') break;
-
-      const found = await fetchCandidates(sid, query);
-      dbg.retrieved += found.length;
-      dbg.retrievedTotal += found.length;
-
-      for (const cand of found) {
-        // ── Role + accessory rejection ──
-        const candClassified = classifyListingRuntime(cand.title);
-        if (candClassified.role !== 'main_product') { dbg.rejectedRole++; dbg.hardRejected++; continue; }
-
-        // ── Category rejection ──
-        // Note: allow 'unknown' cat on either side to pass through (let bucketing decide)
-        const candTax = taxonomy(cand.title);
-        if (baseTax.cat !== 'unknown' && candTax.cat !== 'unknown' && baseTax.cat !== candTax.cat) {
-          dbg.rejectedIntentMismatch++; dbg.hardRejected++; continue;
-        }
-
-        // ── Price sanity (floor only — ceiling handled by decideDealBucket) ──
-        if (!priceSane(baseTax.sub, cand.price)) { dbg.rejectedPrice++; dbg.hardRejected++; continue; }
-
-        // ── Plugin scoring ──
-        let identMatch = 'uncertain', score = 0, label = 'Similar', mTier = 'RELATED';
-        try {
-          if (plugin === audioPlugin || plugin === laptopPlugin) {
-            identMatch = plugin.identityMatch(baseTitle, cand.title);
-          } else {
-            identMatch = plugin.identityMatch(baseTitle, cand.title);
-          }
-          score  = plugin.score(baseTitle, cand.title);
-          label  = plugin.label(identMatch);
-          mTier  = plugin.matchTier(identMatch);
-        } catch {}
-
-        // ── Classifier confidence gate ──────────────────────
-        if (candClassified.numericConfidence !== undefined && candClassified.numericConfidence < 25) {
-          dbg.rejectedClassifierLowConfidence++; dbg.hardRejected++; continue;
-        }
-
-        // ── Final bucketing ──────────────────────────────────
-        const baseVariant = extractVariant(baseTitle || '');
-        const { bucket, reason } = decideDealBucket(
-          { baseTitle, basePrice, baseTax, baseClassified },
-          { cand, identMatch, score, candTax, candClassified }
-        );
-
-        if (bucket === 'DROP') continue;
-
-        // Mark acceptedSeen AFTER bucket decision — not during retrieval.
-        // This is the critical fix: items rejected in PASS 1 can still surface in PASS 3.
-        const acceptKey = `${cand.storeId}|${cand.storeProductId}`;
-        if (acceptedSeen.has(acceptKey)) continue;
-        acceptedSeen.add(acceptKey);
-
-        dbg.accepted++;
-        acceptedForStore++;
-        if (bucket === 'BEST_DEALS')   { dbg.acceptedBestDeals++; }
-        else if (bucket === 'OTHER_MODELS') { dbg.acceptedOtherModels++; }
-
-        const item = {
-          ...cand,
-          name:       STORE_DISPLAY[sid] || sid,
-          matchTier:  mTier,
-          matchLabel: label,
-          condition:  /\bused\b|\brefurbished\b/.test((cand.title||'').toLowerCase()) ? 'used' : 'new',
-          score,
-          bucket,
-          identMatch,
-          candBrand: candClassified.brand,
-        };
-
-        if (bucket === 'BEST_DEALS')   rawBest.push(item);
-        else if (bucket === 'OTHER_MODELS') rawOther.push(item);
+  // Only attempt vector search if this listing already has an embedding in DB.
+  // If it doesn't, skip straight to ilike — generateEmbedding would block here
+  // waiting for Gemini (up to 10s) and cause the extension to timeout.
+  // autoEmbedListing fires async after the upsert and will embed it for next visit.
+  let embedding = embCache.get((baseTitle||'').trim().slice(0, 200)); // check in-memory first
+  if (!embedding) {
+    try {
+      const { data: listingRow } = await supabase
+        .from('store_listings').select('embedding')
+        .eq('store_id', storeId).eq('store_product_id', storeProductId).maybeSingle();
+      if (listingRow?.embedding) {
+        // Row has embedding in DB — safe to generate/use (will hit Gemini only if not in embCache)
+        embedding = await generateEmbedding(baseTitle);
       }
+      // else: no embedding yet — skip vector, use ilike fallback below
+    } catch { /* silently fall through to ilike */ }
+  }
+
+  if (embedding) {
+    try {
+      const { data: vecRows, error: vecErr } = await supabase.rpc("match_listings", {
+        query_embedding:  embedding,
+        exclude_store_id: storeId,
+        match_threshold:  0.55,
+        match_count:      80,
+      });
+
+      if (vecErr) {
+        console.warn(`[vector] RPC error: ${vecErr.message} — falling back to ilike`);
+      } else if (vecRows && vecRows.length > 0) {
+        // Batch-fetch prices per store in parallel
+        const byStore = {};
+        for (const r of vecRows) {
+          (byStore[r.store_id] = byStore[r.store_id] || []).push(r.store_product_id);
+        }
+        const priceMap = new Map();
+        await Promise.all(Object.entries(byStore).map(async ([sid, ids]) => {
+          const { data: prods } = await supabase.from("products")
+            .select("store_id,store_product_id,last_price,currency")
+            .eq("store_id", sid).in("store_product_id", ids);
+          for (const p of (prods || []))
+            priceMap.set(`${p.store_id}|${p.store_product_id}`, p);
+        }));
+
+        dbg.retrievedTotal = vecRows.length;
+        dbg.vectorUsed = true;
+        vectorWorked = true;
+
+        for (const row of vecRows) {
+          const p = priceMap.get(`${row.store_id}|${row.store_product_id}`);
+          if (!p) continue;
+          const price = Number(p.last_price);
+          if (!Number.isFinite(price) || price <= 0) continue;
+          scoreAndBucket({
+            storeId: row.store_id, storeProductId: String(row.store_product_id),
+            title: row.title || "", price,
+            currency: p.currency || baseCurrency || "USD",
+            url: row.page_url || row.canonical_url || null,
+          });
+        }
+        console.log(`[vector] retrieved=${vecRows.length} best=${rawBest.length} other=${rawOther.length} for "${baseTitle.slice(0,45)}"`);
+      } else {
+        console.log(`[vector] 0 results above threshold — falling back to ilike`);
+      }
+    } catch (e) {
+      console.warn(`[vector] error: ${e.message} — falling back to ilike`);
     }
+  }
+
+  // ── ILIKE FALLBACK — only if vector returned nothing ───────
+  if (!vectorWorked) {
+    const queries = buildRetrievalQueries(baseTitle, baseTax);
+    const { data: stores } = await supabase.from('stores').select('id').neq('id', storeId);
+    const storeIds = (stores || []).map(s => s.id);
+
+    async function fetchCandidates(sid, query) {
+      let q = supabase.from('store_listings')
+        .select('store_id,store_product_id,title,page_url,canonical_url')
+        .eq('store_id', sid).limit(100);
+      if (query.mode === 'OR' && query.terms.length > 1) {
+        const safe = t => t.replace(/[%_,]/g, ' ').trim().replace(/\s+/g,' ');
+        const orClause = query.terms.filter(t => t.trim().length > 0)
+          .map(t => `title.ilike.%${safe(t)}%`).join(',');
+        if (orClause) q = q.or(orClause);
+      } else {
+        for (const term of query.terms) q = q.ilike('title', `%${term}%`);
+      }
+      const { data: listings } = await q;
+      console.log(`[fetch] store=${sid} mode=${query.mode} terms=${JSON.stringify(query.terms)} found=${listings?.length||0}`);
+      if (!listings?.length) return [];
+      const { data: prods } = await supabase.from('products')
+        .select('store_id,store_product_id,last_price,currency')
+        .eq('store_id', sid).in('store_product_id', listings.map(x => x.store_product_id));
+      if (!prods?.length) return [];
+      const pm = new Map(prods.map(p => [`${p.store_id}|${p.store_product_id}`, p]));
+      const localSeen = new Set();
+      const out = [];
+      for (const li of listings) {
+        const key = `${sid}|${li.store_product_id}`;
+        if (localSeen.has(key)) continue;
+        const p = pm.get(key); if (!p) continue;
+        const price = Number(p.last_price);
+        if (!Number.isFinite(price) || price <= 0) continue;
+        localSeen.add(key);
+        dbg.dedupedTotal = (dbg.dedupedTotal||0) + 1;
+        out.push({ storeId: sid, storeProductId: String(li.store_product_id), title: li.title||'', price, currency: p.currency||baseCurrency||'USD', url: li.page_url||li.canonical_url||null });
+      }
+      return out;
+    }
+
+    async function processStore(sid) {
+      const localDbg = { retrieved: 0, retrievedTotal: 0 };
+      let acceptedForStore = 0;
+      for (const query of queries) {
+        if (acceptedForStore >= 6 && query.mode === 'OR') break;
+        const found = await fetchCandidates(sid, query);
+        localDbg.retrieved += found.length; localDbg.retrievedTotal += found.length;
+        for (const cand of found) {
+          const before = dbg.accepted;
+          scoreAndBucket(cand);
+          if (dbg.accepted > before) acceptedForStore++;
+        }
+      }
+      dbg.retrievedTotal += localDbg.retrievedTotal;
+    }
+    await Promise.all(storeIds.map(sid => processStore(sid)));
+    console.log(`[ilike] best=${rawBest.length} other=${rawOther.length} for "${baseTitle.slice(0,45)}"`);
   }
 
   // ── Dedup: if an item is in both, keep in bestDeals only ──
@@ -3803,14 +4040,11 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
   const TIER_ORDER = { EXACT:0, SAME_VARIANT:1, SAME_MODEL:2, SAME_FAMILY:3, RELATED:4 };
   const COND_ORDER = { new:0, unknown:1, used:2 };
   rawBest.sort((a, b) => {
-    // cheaper first
     const ac = Number.isFinite(basePrice) && a.price < basePrice;
     const bc = Number.isFinite(basePrice) && b.price < basePrice;
     if (ac !== bc) return ac ? -1 : 1;
-    // tier
     const td = (TIER_ORDER[a.matchTier]||5) - (TIER_ORDER[b.matchTier]||5);
     if (td !== 0) return td;
-    // condition
     const cd = (COND_ORDER[a.condition]||1) - (COND_ORDER[b.condition]||1);
     if (cd !== 0) return cd;
     return b.score - a.score || a.price - b.price;
@@ -3829,19 +4063,16 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
 
   dbg.bestDeals   = rawBest.length;
   dbg.otherModels = otherDeduped.length;
-  // Rich debug log — base classification + counts + top results
   const _dbgLog = {
     baseTitle: baseTitle.slice(0, 60),
     baseSub: baseTax.sub, baseCat: baseTax.cat,
     baseIntent: baseClassified.intentClass, baseBrand: baseClassified.brand,
+    vectorUsed: dbg.vectorUsed,
     counts: {
-      retrieved: dbg.retrievedTotal,
-      rejectedRole: dbg.rejectedRole,
-      rejectedPrice: dbg.rejectedPrice,
-      rejectedLowConf: dbg.rejectedClassifierLowConfidence,
+      retrieved: dbg.retrievedTotal, rejectedRole: dbg.rejectedRole,
+      rejectedPrice: dbg.rejectedPrice, rejectedLowConf: dbg.rejectedClassifierLowConfidence,
       rejectedIntent: dbg.rejectedIntentMismatch,
-      acceptedBest: dbg.acceptedBestDeals,
-      acceptedOther: dbg.acceptedOtherModels,
+      acceptedBest: dbg.acceptedBestDeals, acceptedOther: dbg.acceptedOtherModels,
     },
     topBest:  rawBest.slice(0,5).map(d => ({ t: d.title?.slice(0,40), p: d.price, id: d.identMatch })),
     topOther: otherDeduped.slice(0,5).map(d => ({ t: d.title?.slice(0,40), p: d.price, id: d.identMatch })),
@@ -3850,11 +4081,10 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
 
   return {
     bestDeals:   rawBest.slice(0, limit),
-    otherModels: otherDeduped,   // return ALL — caller decides how many to send
+    otherModels: otherDeduped,
     meta: { baseCategory: baseTax.cat, baseSubcategory: baseTax.sub, ...dbg }
   };
 }
-
 
 // ============================================================
 //  SCHEMAS
@@ -4115,20 +4345,58 @@ app.post("/v1/observations", async (req, res) => {
   try {
     const urlHost = (() => { try { return new URL(o.pageUrl).host.toLowerCase().replace(/^www\./,""); } catch { return null; } })();
     await supabase.from("store_listings").upsert({ store_id: o.storeId, host: urlHost||o.host||"unknown", store_product_id: o.storeProductId, canonical_url: o.canonicalUrl, page_url: o.pageUrl, title: o.title, image_url: o.imageUrl, currency: o.currency }, { onConflict: "store_id,store_product_id" });
+    // Auto-embed new listings — fires async, never blocks the response
+    autoEmbedListing(o.storeId, o.storeProductId, o.title).catch(() => {});
   } catch {}
 
   const { data: lastObs } = await supabase.from("price_observations").select("price,observed_at").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(1);
   const last = lastObs?.[0] || null;
   const samePrice = last && Math.abs(Number(last.price) - o.price) < 0.00001;
   const ageMs = last ? Date.now() - new Date(last.observed_at).getTime() : Infinity;
+  const priceChanged = !samePrice && last !== null; // true only when price actually moved
   if (!samePrice || ageMs > 6 * 60 * 60 * 1000) {
     await supabase.from("price_observations").insert({ product_id: product.id, price: o.price, currency: o.currency, source: o.source||"extension", page_url: o.pageUrl, observed_at: new Date().toISOString() });
   }
 
+  // ── Deals cache — keyed on store+product+price ─────────────
+  // If price changed since last observation, invalidate so results
+  // reflect the new price context. Otherwise serve cached payload.
+  const dealsCacheKey = `deals:${o.storeId}:${o.storeProductId}:${Math.round(o.price * 100)}`;
+  let dealsResult = null;
+
+  if (!priceChanged) {
+    // Try to load from Supabase deals_cache
+    try {
+      const { data: cached } = await supabase.from("deals_cache")
+        .select("payload, expires_at").eq("cache_key", dealsCacheKey).maybeSingle();
+      if (cached && new Date(cached.expires_at) > new Date()) {
+        dealsResult = cached.payload;
+        console.log(`[deals-cache] HIT ${dealsCacheKey}`);
+      } else if (cached) {
+        // expired — delete it async
+        supabase.from("deals_cache").delete().eq("cache_key", dealsCacheKey).then(() => {}).catch(() => {});
+      }
+    } catch (e) { console.warn(`[deals-cache] read error: ${e.message}`); }
+  } else {
+    // Price changed — proactively delete stale cache entries for this product
+    supabase.from("deals_cache").delete()
+      .like("cache_key", `deals:${o.storeId}:${o.storeProductId}:%`)
+      .then(() => {}).catch(() => {});
+    console.log(`[deals-cache] INVALIDATED (price changed) ${o.storeId}/${o.storeProductId}`);
+  }
+
+  if (!dealsResult) {
+    dealsResult = await computeDealsForProduct({ storeId: o.storeId, storeProductId: o.storeProductId, baseTitle: o.title||product.title||"", baseCurrency: o.currency, basePrice: o.price, limit: 10 });
+    // Save to cache async — 2 hour TTL
+    const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    supabase.from("deals_cache").upsert(
+      { cache_key: dealsCacheKey, payload: dealsResult, expires_at: expiresAt },
+      { onConflict: "cache_key" }
+    ).then(() => {}).catch(e => console.warn(`[deals-cache] write error: ${e.message}`));
+  }
   const { data: obsRows } = await supabase.from("price_observations").select("price,observed_at").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(120);
   const prices = (obsRows||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
   const stats  = computeStats(prices);
-  const dealsResult = await computeDealsForProduct({ storeId: o.storeId, storeProductId: o.storeProductId, baseTitle: o.title||product.title||"", baseCurrency: o.currency, basePrice: o.price, limit: 10 });
   const bestDealsObs = dealsResult.bestDeals || [];
 
   // Heuristic only — instant, no API
@@ -4139,14 +4407,31 @@ app.post("/v1/observations", async (req, res) => {
     fakeDeal = heuristicDetect(o.price, o.wasPrice, o.currency, prices, bestDealsObs.map(d=>d.price).filter(Number.isFinite));
   }
 
-  // Prediction (async: EWMA + holiday + attr extraction)
-  const prediction = await computePredictionV2({
+  // Prediction — apply shipping rules, then log for evaluation
+  const _predAttrs = o.title ? await extractProductAttrs(o.title || product.title || '') : null;
+  const _rawPred = await computePredictionV2({
     title: o.title || product.title || "",
     currentPrice: o.price, currency: o.currency,
     storeId: o.storeId, storeProductId: o.storeProductId,
+    historyRows: obsRows || [],
     historyPrices: prices,
     peerPrices: bestDealsObs.map(d => d.price).filter(Number.isFinite),
   });
+  const prediction = applyShippingRules(_rawPred, {
+    nHist: prices.length, nPeer: bestDealsObs.length,
+    category: _predAttrs?.category || null,
+  });
+  if (_rawPred && !_rawPred.fromCache) {
+    logPrediction({
+      storeId: o.storeId, storeProductId: o.storeProductId,
+      url: o.canonicalUrl || o.pageUrl || null,
+      title: o.title || product.title || '',
+      category: _predAttrs?.category || null,
+      brand: _predAttrs?.brand || null,
+      currentPrice: o.price, currency: o.currency,
+      prediction: _rawPred, attrs: _predAttrs,
+    }).catch(() => {});
+  }
 
   // Fire any active price alerts (async — don't block response)
   checkAndFireAlerts(o.storeId, o.storeProductId, o.price, o.currency, o.title||product.title, o.canonicalUrl||o.pageUrl).catch(() => {});
@@ -4257,11 +4542,13 @@ app.post("/v1/ai/fake-deal", async (req, res) => {
 
   const title = product?.title || reqTitle || "";
   let historyPrices = [];
+  let historyRows   = [];
   if (product?.id) {
     const { data: hist } = await supabase.from("price_observations")
-      .select("price").eq("product_id", product.id)
+      .select("price, observed_at").eq("product_id", product.id)
       .order("observed_at", { ascending: false }).limit(120);
-    historyPrices = (hist||[]).map(r => Number(r.price)).filter(Number.isFinite);
+    historyRows   = (hist || []).filter(r => Number.isFinite(Number(r.price)));
+    historyPrices = historyRows.map(r => Number(r.price));
   }
 
   // 2. Get peer prices from our deals engine (DB cross-store prices)
@@ -4272,17 +4559,21 @@ app.post("/v1/ai/fake-deal", async (req, res) => {
   // peerPrices MUST use bestDeals only — never otherModels (would skew fake deal analysis)
   const peerPrices = (dealsR4.bestDeals||[]).map(d => d.price).filter(Number.isFinite);
 
-  // 3. Cache check (after we know the title for better cache key)
+  // 3. Cache check — reanalyze=true bypasses cache entirely
+  const reanalyze = req.body.reanalyze === true || req.query.reanalyze === 'true';
   const cKey = detectCacheKey(product?.id || storeProductId, Number(wasPrice), Number(currentPrice));
-  const cached = detectCache.get(cKey);
-  if (cached) return res.json({ ok: true, ...cached, fromCache: true, pending: false });
+  if (!reanalyze) {
+    const cached = detectCache.get(cKey);
+    if (cached) return res.json({ ok: true, ...cached, fromCache: true, pending: false });
+  }
 
-  // 4. Run the full analysis pipeline (DB refs + SerpAPI if needed)
+  // 4. Run the full analysis pipeline (tiers: peers → history → serp → gemini)
   try {
     const result = await analyseDeal({
       title, currentPrice: Number(currentPrice), wasPrice: Number(wasPrice),
       currency: currency||"USD", storeId, storeProductId,
-      historyPrices, peerPrices,
+      historyRows, historyPrices, peerPrices,
+      reanalyze,
     });
     detectCache.set(cKey, result);
     return res.json({ ok: true, ...result, pending: false });
@@ -4401,66 +4692,51 @@ async function _geminiForPred(service, prompt, maxTokens) {
 // typicalDropPct per category group.
 // "Window" = from (event_start - leadDays) to (event_end + lagDays).
 const HOLIDAY_EVENTS = [
+  // Only events Amazon, eBay, AliExpress, Apple, Samsung, HP, Lenovo, Dell officially run
+  {
+    name: 'New Year Sales', key: 'newyear',
+    startMMDD: '01-01', endMMDD: '01-07', leadDays: 0, lagDays: 2,
+    dropPct: { electronics: 0.09, laptop: 0.08, phone: 0.07, subscription: 0.10, default: 0.05 }
+  },
+  {
+    name: 'Amazon Prime Day', key: 'prime',
+    startMMDD: '07-08', endMMDD: '07-12', leadDays: 5, lagDays: 3,
+    dropPct: { electronics: 0.20, audio: 0.18, console: 0.15, controller: 0.13, laptop: 0.18, phone: 0.17, subscription: 0.14, default: 0.11 }
+  },
+  {
+    name: 'Back to School', key: 'bts',
+    startMMDD: '08-01', endMMDD: '09-15', leadDays: 7, lagDays: 5,
+    dropPct: { laptop: 0.16, electronics: 0.11, phone: 0.10, subscription: 0.09, default: 0.06 }
+  },
+  {
+    name: 'Amazon Fall Sale', key: 'prime_fall',
+    startMMDD: '10-08', endMMDD: '10-12', leadDays: 5, lagDays: 3,
+    dropPct: { electronics: 0.18, audio: 0.15, laptop: 0.15, phone: 0.14, subscription: 0.12, default: 0.09 }
+  },
+  {
+    name: "Singles' Day", key: 'singles',
+    startMMDD: '11-09', endMMDD: '11-11', leadDays: 5, lagDays: 2,
+    dropPct: { electronics: 0.18, audio: 0.17, phone: 0.17, laptop: 0.15, default: 0.10 }
+  },
   {
     name: 'Black Friday', key: 'bf',
-    // 4th Friday of November — approximated as Nov 22-29 window
-    startMMDD: '11-22', endMMDD: '11-29',
-    leadDays: 7, lagDays: 3,
-    dropPct: { electronics: 0.22, audio: 0.20, console: 0.18, controller: 0.15, subscription: 0.15, laptop: 0.20, phone: 0.18, default: 0.12 }
+    startMMDD: '11-22', endMMDD: '11-29', leadDays: 7, lagDays: 3,
+    dropPct: { electronics: 0.22, audio: 0.20, console: 0.18, controller: 0.15, subscription: 0.15, laptop: 0.21, phone: 0.18, tv: 0.25, default: 0.13 }
   },
   {
     name: 'Cyber Monday', key: 'cm',
-    startMMDD: '11-30', endMMDD: '12-02',
-    leadDays: 1, lagDays: 2,
+    startMMDD: '11-30', endMMDD: '12-02', leadDays: 1, lagDays: 2,
     dropPct: { electronics: 0.18, audio: 0.18, console: 0.15, controller: 0.13, subscription: 0.13, laptop: 0.18, phone: 0.15, default: 0.10 }
   },
   {
     name: 'Christmas', key: 'xmas',
-    startMMDD: '12-20', endMMDD: '12-25',
-    leadDays: 5, lagDays: 0,
-    dropPct: { electronics: 0.12, audio: 0.12, console: 0.12, controller: 0.10, subscription: 0.10, laptop: 0.12, phone: 0.10, default: 0.08 }
+    startMMDD: '12-20', endMMDD: '12-25', leadDays: 5, lagDays: 0,
+    dropPct: { electronics: 0.13, audio: 0.13, console: 0.13, controller: 0.10, subscription: 0.10, laptop: 0.12, phone: 0.10, default: 0.08 }
   },
   {
     name: 'Boxing Day', key: 'boxing',
-    startMMDD: '12-26', endMMDD: '12-31',
-    leadDays: 0, lagDays: 3,
-    dropPct: { electronics: 0.15, audio: 0.15, console: 0.13, controller: 0.10, subscription: 0.08, laptop: 0.15, phone: 0.12, default: 0.08 }
-  },
-  {
-    name: 'New Year Sales', key: 'newyear',
-    startMMDD: '01-01', endMMDD: '01-07',
-    leadDays: 0, lagDays: 2,
-    dropPct: { electronics: 0.10, subscription: 0.12, default: 0.06 }
-  },
-  {
-    name: 'Amazon Prime Day', key: 'prime',
-    startMMDD: '07-08', endMMDD: '07-12',
-    leadDays: 5, lagDays: 3,
-    dropPct: { electronics: 0.18, audio: 0.15, console: 0.15, controller: 0.12, laptop: 0.15, phone: 0.15, subscription: 0.12, default: 0.10 }
-  },
-  {
-    name: 'Back to School', key: 'bts',
-    startMMDD: '08-01', endMMDD: '09-15',
-    leadDays: 7, lagDays: 5,
-    dropPct: { laptop: 0.15, electronics: 0.10, phone: 0.10, subscription: 0.08, default: 0.05 }
-  },
-  {
-    name: "Singles' Day", key: 'singles',
-    startMMDD: '11-09', endMMDD: '11-11',
-    leadDays: 3, lagDays: 2,
-    dropPct: { electronics: 0.15, audio: 0.15, phone: 0.15, default: 0.08 }
-  },
-  {
-    name: 'Valentine\'s Day', key: 'val',
-    startMMDD: '02-10', endMMDD: '02-14',
-    leadDays: 4, lagDays: 1,
-    dropPct: { default: 0.06 }
-  },
-  {
-    name: 'Memorial Day', key: 'memorial',
-    startMMDD: '05-25', endMMDD: '05-27',
-    leadDays: 3, lagDays: 1,
-    dropPct: { electronics: 0.08, laptop: 0.08, default: 0.05 }
+    startMMDD: '12-26', endMMDD: '12-31', leadDays: 0, lagDays: 3,
+    dropPct: { electronics: 0.15, audio: 0.15, console: 0.14, controller: 0.11, subscription: 0.08, laptop: 0.15, phone: 0.13, default: 0.09 }
   },
 ];
 
@@ -4700,344 +4976,493 @@ function percentile(sorted, p) {
 function logistic(x) { return 1 / (1 + Math.exp(-x)); }
 
 // ── 4. Core prediction engine ────────────────────────────────
-async function computePredictionV2({ title, currentPrice, currency, storeId, storeProductId, historyPrices, peerPrices, now: _now }) {
-  const now   = _now || new Date();
-  const cur   = Number(currentPrice);
-  const curr  = currency || 'USD';
-  const DEBUG = process.env.DEBUG_PREDICTION === '1';
+
+// ============================================================
+//  PRICE PREDICTION ENGINE v3
+//  Timestamp-aware slope · store+category holiday impact
+//  45-day event gating · split data/forecast confidence
+//  Peer constraints · rich sentence output
+// ============================================================
+
+// ── A) Timestamp-based time features ──────────────────────────
+function computeTimeFeatures(historyRows) {
+  if (!historyRows || historyRows.length < 2) {
+    return { slope: 0, volatility: 0, spanDays: 0, obsPerDay: 0, reliable: false };
+  }
+
+  const rows = historyRows
+    .map(r => ({ p: Number(r.price), t: new Date(r.observed_at).getTime() }))
+    .filter(r => Number.isFinite(r.p) && r.p > 0 && !isNaN(r.t))
+    .sort((a, b) => a.t - b.t);
+
+  if (rows.length < 2) return { slope: 0, volatility: 0, spanDays: 0, obsPerDay: 0, reliable: false };
+
+  const spanMs   = rows[rows.length - 1].t - rows[0].t;
+  const spanDays = spanMs / 86400000;
+  const obsPerDay = rows.length / Math.max(spanDays, 1);
+
+  // Median daily slope (robust to outliers)
+  const deltas = [];
+  for (let i = 1; i < rows.length; i++) {
+    const dDays = (rows[i].t - rows[i-1].t) / 86400000;
+    if (dDays > 0) deltas.push((rows[i].p - rows[i-1].p) / dDays);
+  }
+  deltas.sort((a, b) => a - b);
+  const medSlope = deltas.length ? deltas[Math.floor(deltas.length / 2)] : 0;
+
+  // Volatility = stddev of absolute daily deltas
+  const absD = deltas.map(Math.abs);
+  const mean = absD.reduce((s, v) => s + v, 0) / (absD.length || 1);
+  const variance = absD.reduce((s, v) => s + (v - mean) ** 2, 0) / (absD.length || 1);
+
+  return {
+    slope:      Math.round(medSlope       * 10000) / 10000,
+    volatility: Math.round(Math.sqrt(variance) * 10000) / 10000,
+    spanDays:   Math.round(spanDays),
+    obsPerDay:  Math.round(obsPerDay * 100) / 100,
+    reliable:   spanDays >= 7 && rows.length >= 3,
+  };
+}
+
+// ── B) Holiday impact — store + category sensitive ─────────────
+// Only non-zero when event is within 45 days or active (hard gate).
+function holidayImpact(store, category, hCtx) {
+  const cat    = (category || 'electronics').toLowerCase();
+  const daysTo = hCtx.insideWindow ? 0 : hCtx.daysUntilNext;
+
+  // Hard gate: beyond 45 days → zero, do NOT show event in card
+  if (daysTo > 45) return { dropProbBoost: 0, expectedDropDepthPct: 0, impactLabel: null, daysToEvent: daysTo, eventName: null };
+
+  const proximity = hCtx.insideWindow ? 1.0
+    : daysTo <= 14 ? 0.85
+    : daysTo <= 30 ? 0.65
+    : 0.35;
+
+  const CAT_WEIGHT = {
+    electronics: 1.00, laptop: 1.00, audio: 0.95, phone: 0.80,
+    console: 0.85, controller: 0.75, tablet: 0.80, tv: 1.05,
+    home: 0.60, fashion: 0.70, subscription: 0.55, default: 0.65,
+  };
+  const STORE_WEIGHT = {
+    amazon: 1.00, ebay: 0.85, aliexpress: 0.90, apple: 0.55,
+    samsung: 0.70, hp: 0.80, lenovo: 0.85, dell: 0.80, default: 0.75,
+  };
+
+  const cw = CAT_WEIGHT[cat] ?? CAT_WEIGHT.default;
+  const sw = STORE_WEIGHT[(store||'').toLowerCase()] ?? STORE_WEIGHT.default;
+  const baseDepth  = hCtx.nextEventDropPct || 0.10;
+  const effDepth   = baseDepth * cw * sw * proximity;
+  const probBoost  = Math.min(0.40, effDepth * 2.5 * proximity);
+  const pct        = Math.round(effDepth * 100);
+
+  return {
+    dropProbBoost:        Math.round(probBoost * 100) / 100,
+    expectedDropDepthPct: Math.round(effDepth  * 1000) / 1000,
+    impactLabel:          pct >= 3 ? `~${pct}% typical drop` : null,
+    daysToEvent:          daysTo,
+    eventName:            hCtx.insideWindow ? hCtx.activeEvent : hCtx.nextEvent,
+  };
+}
+
+// ── C) Product signals from own history ───────────────────────
+function computeProductSignals(historyRows, currentPrice) {
+  const cur = Number(currentPrice);
+  const empty = {
+    baseline: cur, histMin: null, histMax: null,
+    aboveAvgPct: null, aboveLowPct: null,
+    recentAvg: null, olderAvg: null,
+    velocityPct: 0, fallingFast: false, risingFast: false,
+    trendDir: 'unknown', timeFeatures: null,
+  };
+  if (!historyRows || historyRows.length === 0) return empty;
+
+  const prices = historyRows.map(r => Number(r.price)).filter(n => Number.isFinite(n) && n > 0);
+  if (!prices.length) return empty;
+
+  const sorted   = [...prices].sort((a, b) => a - b);
+  const ewma     = computeEWMA(prices);
+  const baseline = ewma || prices.reduce((a, b) => a + b, 0) / prices.length;
+  const histMin  = sorted[0];
+  const histMax  = sorted[sorted.length - 1];
+  const tf       = computeTimeFeatures(historyRows);
+
+  const FALL_T = baseline * 0.0012;
+  const RISE_T = baseline * 0.0012;
+  const fallingFast = tf.slope < -FALL_T;
+  const risingFast  = tf.slope >  RISE_T;
+
+  const recentPrices = prices.slice(0, 3);
+  const olderPrices  = prices.slice(3, 8);
+  const recentAvg = recentPrices.length ? Math.round(recentPrices.reduce((a,b)=>a+b,0)/recentPrices.length*100)/100 : null;
+  const olderAvg  = olderPrices.length  ? Math.round(olderPrices.reduce((a,b)=>a+b,0)/olderPrices.length*100)/100   : null;
+  const velocityPct = (recentAvg && olderAvg) ? (recentAvg - olderAvg) / olderAvg : 0;
+
+  const trendDir = fallingFast ? 'falling fast'
+    : risingFast             ? 'rising fast'
+    : tf.slope < -FALL_T*0.3 ? 'falling'
+    : tf.slope >  RISE_T*0.3 ? 'rising'
+    : 'stable';
+
+  return {
+    baseline:    Math.round(baseline * 100) / 100,
+    histMin, histMax,
+    aboveAvgPct: Math.round((cur - baseline) / baseline * 100),
+    aboveLowPct: Math.round((cur - histMin)  / histMin  * 100),
+    recentAvg, olderAvg, velocityPct,
+    fallingFast, risingFast, trendDir,
+    timeFeatures: tf,
+  };
+}
+
+// ── D) Combine all signals → prediction object ─────────────────
+function combineSignals({ cur, fmt, signals, holiday, peers, nHist, nPeer }) {
+  const {
+    baseline, histMin, aboveAvgPct, aboveLowPct,
+    recentAvg, olderAvg, velocityPct, fallingFast, risingFast, trendDir,
+  } = signals;
+
+  const { dropProbBoost, expectedDropDepthPct, impactLabel, daysToEvent, eventName } = holiday;
+
+  // Peer median
+  const pSorted    = [...peers].sort((a,b)=>a-b);
+  const peerMedian = peers.length ? pSorted[Math.floor(pSorted.length/2)] : null;
+  const vsMedianPct = peerMedian ? Math.round((cur - peerMedian) / peerMedian * 100) : null;
+  const peerSignal  = vsMedianPct === null ? 'unknown'
+    : vsMedianPct >  12 ? 'expensive'
+    : vsMedianPct < -8  ? 'cheap'
+    : 'fair';
+
+  // 30-day forecast
+  const tf        = signals.timeFeatures || { slope: 0, volatility: 0, reliable: false };
+  const projected = nHist >= 3 && tf.reliable ? baseline + tf.slope * 30 : baseline;
+  const band      = Math.max((tf.volatility || 0) * 30 * 1.2, baseline * 0.04);
+  const hShift    = baseline * expectedDropDepthPct;
+
+  let eMin = Math.round(Math.max(cur * 0.40, projected - band - hShift) * 100) / 100;
+  let eMed = Math.round(Math.max(cur * 0.50, projected)                 * 100) / 100;
+  let eMax = Math.round((projected + band)                               * 100) / 100;
+
+  if (nPeer >= 2) {
+    const pP25 = percentile(pSorted, 0.25);
+    const pP75 = percentile(pSorted, 0.75);
+    eMin = Math.round(Math.max(eMin, pP25 * 0.88) * 100) / 100;
+    eMed = Math.round(Math.min(Math.max(eMed, eMin), pP75 * 1.05) * 100) / 100;
+  }
+
+  // Drop probability
+  const trendBoost = fallingFast ? 0.20 : trendDir === 'falling' ? 0.10 : 0;
+  const baseDrop   = nHist >= 5
+    ? (aboveAvgPct > 10 ? 0.35 : aboveAvgPct > 0 ? 0.22 : 0.12)
+    : (peerSignal === 'expensive' ? 0.30 : 0.18);
+  const dropProbability30d = Math.min(0.92, Math.round((baseDrop + dropProbBoost + trendBoost) * 100) / 100);
+
+  // Target buy price — lowest realistic price below current
+  const candidates = [
+    histMin,
+    nPeer >= 2 ? percentile(pSorted, 0.10) : null,
+    expectedDropDepthPct > 0.02 ? Math.round(Math.min(cur, peerMedian||cur) * (1 - expectedDropDepthPct) * 100)/100 : null,
+    eMin,
+  ].filter(v => v !== null && Number.isFinite(v) && v < cur * 0.98 && v > cur * 0.40);
+  const targetBuyPrice = candidates.length ? Math.round(Math.min(...candidates)*100)/100 : null;
+
+  // ── Verdict + rich sentence reasoning ──
+  const mStr = peerMedian ? `market median ${fmt(peerMedian)} across ${peers.length + 1} stores` : null;
+  let verdict, action, reasoning;
+
+  if (daysToEvent === 0 && aboveLowPct !== null && aboveLowPct < 10) {
+    verdict = 'BUY'; action = 'buy';
+    reasoning = `${eventName} is active and at ${fmt(cur)} the price is near its tracked low of ${fmt(histMin)} — one of the best prices you will see this cycle.`;
+  } else if (daysToEvent === 0) {
+    verdict = 'WAIT'; action = 'wait';
+    reasoning = `${eventName} is active but at ${fmt(cur)} the price is still ${aboveLowPct}% above its tracked low of ${fmt(histMin)} — expect it to drop further toward ${fmt(eMin)} before the window closes.`;
+  } else if (peerSignal === 'expensive' && daysToEvent !== null && daysToEvent <= 45) {
+    verdict = 'WAIT'; action = 'wait';
+    reasoning = `At ${fmt(cur)} you are paying ${Math.abs(vsMedianPct)}% above the ${mStr}, and ${eventName} is ${daysToEvent <= 14 ? 'only ' + daysToEvent + ' days away' : 'within 45 days'} — ${impactLabel || 'a price drop is expected'}, putting the target buy price around ${fmt(targetBuyPrice || eMin)}.`;
+  } else if (peerSignal === 'expensive') {
+    verdict = 'WAIT'; action = 'wait';
+    reasoning = `At ${fmt(cur)} this is ${Math.abs(vsMedianPct)}% above the ${mStr}${aboveAvgPct !== null ? ', and ' + aboveAvgPct + '% above its own tracked average of ' + fmt(baseline) : ''} — consider waiting for a correction toward ${fmt(peerMedian || eMin)}.`;
+  } else if (fallingFast) {
+    verdict = 'WATCH'; action = 'watch';
+    reasoning = `The price is dropping fast — it averaged ${fmt(olderAvg)} previously and is now at ${fmt(recentAvg)}, a ${Math.round(Math.abs(velocityPct)*100)}% move. At this rate it could reach ${fmt(targetBuyPrice || eMin)} within 30 days — set an alert rather than buying now.`;
+  } else if (aboveLowPct !== null && aboveLowPct < 5) {
+    verdict = 'BUY'; action = 'buy';
+    reasoning = `At ${fmt(cur)} this is within 5% of its tracked low of ${fmt(histMin)} across ${nHist} observations${mStr ? ', and the ' + mStr + ' confirms it is competitively priced' : ''} — it rarely gets cheaper than this.`;
+  } else if (aboveAvgPct !== null && aboveAvgPct > 12 && daysToEvent !== null && daysToEvent <= 45) {
+    verdict = 'WAIT'; action = 'wait';
+    reasoning = `At ${fmt(cur)} this is ${aboveAvgPct}% above its tracked average of ${fmt(baseline)} and ${eventName} is ${daysToEvent <= 14 ? daysToEvent + ' days away' : 'within 45 days'} — ${impactLabel || 'a drop is expected'}, with a target buy price around ${fmt(targetBuyPrice || eMin)}.`;
+  } else if (aboveAvgPct !== null && aboveAvgPct > 12) {
+    verdict = 'WAIT'; action = 'wait';
+    const note = risingFast ? 'the price has been climbing and corrections usually follow' : 'consider waiting for the price to return toward its baseline';
+    reasoning = `At ${fmt(cur)} this is ${aboveAvgPct}% above its tracked average of ${fmt(baseline)} across ${nHist} observations — ${note}${mStr ? ', and the ' + mStr + ' is lower' : ''}.`;
+  } else if (risingFast) {
+    verdict = 'WATCH'; action = 'watch';
+    reasoning = `The price has been rising — it averaged ${fmt(olderAvg)} recently and is now at ${fmt(recentAvg)}, a ${Math.round(Math.abs(velocityPct)*100)}% move upward. Worth monitoring for a few days before committing at ${fmt(cur)}.`;
+  } else if (peerSignal === 'cheap') {
+    verdict = 'BUY'; action = 'buy';
+    reasoning = `At ${fmt(cur)} this is ${Math.abs(vsMedianPct)}% below the ${mStr} — cheaper than most stores right now${aboveLowPct !== null && aboveLowPct < 15 ? ', and near its tracked low of ' + fmt(histMin) : ''}. No major sale within 45 days to justify waiting.`;
+  } else {
+    verdict = 'FAIR'; action = 'ok';
+    const tNote = trendDir === 'stable' ? 'Price is stable'
+      : trendDir === 'falling' ? 'Price is gently drifting down'
+      : 'Price has been edging up slightly';
+    const pNote = mStr ? ` The ${mStr} confirms this is in line with the market.` : '';
+    reasoning = `At ${fmt(cur)} this is close to its tracked average of ${fmt(baseline)} across ${nHist} observations — a reasonable price if you need it now. ${tNote}.${pNote}`;
+  }
+
+  // ── Split confidence ──
+  const dataScore = Math.min(100, (nHist * 3) + (nPeer * 5) + (tf.reliable ? 15 : 0));
+  const dataConfidence = dataScore >= 70 ? 'High' : dataScore >= 35 ? 'Medium' : 'Low';
+  const dataConfidenceScore = Math.min(92, Math.max(20, dataScore));
+
+  const sCount = [peerSignal !== 'unknown', tf.reliable, daysToEvent !== null && daysToEvent <= 45, Math.abs(aboveAvgPct||0) > 5].filter(Boolean).length;
+  const forecastConfidence = sCount >= 3 ? 'High' : sCount >= 2 ? 'Medium' : 'Low';
+  const forecastConfidenceScore = Math.min(92, Math.max(20, 35 + sCount * 15 + (nPeer >= 3 ? 8 : 0)));
+  const confidence = Math.round((dataConfidenceScore + forecastConfidenceScore) / 2);
+
+  return {
+    verdict, action, reasoning,
+    targetBuyPrice, trendDirection: trendDir, dropProbability30d,
+    expectedMin30d: eMin, expectedMedian30d: eMed, expectedMax30d: eMax,
+    expectedRange30d: { min: eMin, median: eMed, max: eMax },
+    predictedLow: targetBuyPrice || (eMin < cur ? eMin : null),
+    aboveAvgPct, aboveLowPct, peerSignal, vsMedianPct, peerMedian,
+    confidence, dataConfidence, dataConfidenceScore, forecastConfidence, forecastConfidenceScore,
+    seasonalDriver: daysToEvent !== null && daysToEvent <= 45 ? { eventName, daysToEvent, impactSummary: impactLabel } : null,
+    signals,
+  };
+}
+
+// ── E) Format for UI card ──────────────────────────────────────
+function formatPredictionForUI(pred, fmt) {
+  const confLabel = pred.dataConfidenceScore >= 70 ? 'High' : pred.dataConfidenceScore >= 40 ? 'Medium' : 'Low';
+  const trendLabel = { 'falling fast':'Falling Fast','falling':'Falling','rising fast':'Rising Fast','rising':'Rising','stable':'Stable','unknown':'Unknown' }[pred.trendDirection] || pred.trendDirection;
+  return {
+    verdict: pred.verdict,
+    trendDirection: pred.trendDirection, trendLabel,
+    predictionWindowDays: 30,
+    targetBuyPrice: pred.targetBuyPrice,
+    targetBuyPriceFmt: pred.targetBuyPrice ? fmt(pred.targetBuyPrice) : null,
+    expectedRange30d: pred.expectedRange30d,
+    dropProbability30d: pred.dropProbability30d,
+    confidence: confLabel, confidenceScore: pred.dataConfidenceScore,
+    explanation: pred.reasoning,
+    seasonalDriver: pred.seasonalDriver,
+  };
+}
+
+// ── Main function ──────────────────────────────────────────────
+async function computePredictionV2({ title, currentPrice, currency, storeId, storeProductId, historyPrices, historyRows, peerPrices, now: _now }) {
+  const now  = _now || new Date();
+  const cur  = Number(currentPrice);
+  const curr = currency || 'USD';
+  const fmt  = p => moneyFmt(curr, p);
 
   if (!cur || !Number.isFinite(cur)) return null;
 
-  // ── Cache check ──
-  const cKey = predCacheKey(storeId, storeProductId, Math.round(cur * 100), curr);
+  const cKey   = predCacheKey(storeId, storeProductId, Math.round(cur * 100), curr);
   const cached = predCache.get(cKey);
   if (cached) return { ...cached, fromCache: true };
 
-  // ── Inputs ──
-  const hist  = (historyPrices || []).filter(n => Number.isFinite(n) && n > 0);
-  const peers = (peerPrices    || []).filter(n => Number.isFinite(n) && n > 0);
+  // Accept historyRows (with timestamps) or fall back to flat prices array
+  const rows  = (historyRows || []).filter(r => Number.isFinite(Number(r.price)) && Number(r.price) > 0);
+  const hist  = rows.length
+    ? rows.map(r => Number(r.price))
+    : (historyPrices || []).filter(n => Number.isFinite(n) && n > 0);
+  const peers = (peerPrices || []).filter(n => Number.isFinite(n) && n > 0);
   const nHist = hist.length;
   const nPeer = peers.length;
-  const allPrices = [...hist, ...peers];
-  const sorted    = [...allPrices].sort((a, b) => a - b);
 
-  // ── Attribute extraction ──
-  const attrs  = title ? await extractProductAttrs(title) : ruleBasedAttrs('');
-  const cat    = attrs.category || 'electronics';
+  const attrs   = title ? await extractProductAttrs(title) : ruleBasedAttrs('');
+  const cat     = attrs.category || 'electronics';
+  const hCtx    = getHolidayContext(now, cat);
+  const tf      = computeTimeFeatures(rows.length >= 2 ? rows : null);
+  const signals = rows.length >= 1
+    ? computeProductSignals(rows, cur)
+    : { baseline: cur, histMin: null, histMax: null, aboveAvgPct: null, aboveLowPct: null,
+        recentAvg: null, olderAvg: null, velocityPct: 0, fallingFast: false, risingFast: false,
+        trendDir: 'unknown', timeFeatures: tf };
+  if (!signals.timeFeatures) signals.timeFeatures = tf;
 
-  // ── Holiday context ──
-  const hCtx   = getHolidayContext(now, cat);
+  const holiday  = holidayImpact(storeId, cat, hCtx);
+  const combined = combineSignals({ cur, fmt, signals, holiday, peers, nHist, nPeer });
+  const ui       = formatPredictionForUI(combined, fmt);
 
-  // ── Time series stats ──
-  const ewma       = computeEWMA(hist.length >= 2 ? hist : allPrices);
-  const slope      = computeSlope(hist.length >= 2 ? hist : allPrices);
-  const volatility = computeVolatility(allPrices);
-  const baseline   = ewma || (allPrices.length ? allPrices.reduce((a,b)=>a+b)/allPrices.length : cur);
-  const p25        = sorted.length ? percentile(sorted, 0.25) : cur * 0.92;
-  const p75        = sorted.length ? percentile(sorted, 0.75) : cur * 1.05;
-  const histMin    = sorted.length ? sorted[0] : null;
-  const histMax    = sorted.length ? sorted[sorted.length-1] : null;
+  const allMarket   = [cur, ...peers].filter(n => Number.isFinite(n) && n > 0);
+  const mktSorted   = [...allMarket].sort((a,b) => a - b);
+  const mktMedian   = mktSorted[Math.floor(mktSorted.length / 2)];
 
-  const HORIZON_DAYS     = 30;
-  const VOLATILITY_MULT  = 1.5; // band = 1.5 × robust sigma
+  const allWindows   = [...getHolidayWindows(now.getFullYear()), ...getHolidayWindows(now.getFullYear()+1)];
+  const nextEvtObj   = allWindows.find(w => now < w.windowStart);
+  const nextEvtDate  = nextEvtObj && hCtx.daysUntilNext <= 45
+    ? nextEvtObj.start.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })
+    : null;
 
-  // ── 30-day range forecast ──
-  // slope is per observation; assume ~1 observation per 3 days on average
-  const obsPerDay    = nHist >= 5 ? nHist / 90 : 0.33;
-  const slopePerDay  = slope * obsPerDay;
-  const rawMedian30d = baseline + slopePerDay * HORIZON_DAYS;
-  const band         = volatility * VOLATILITY_MULT;
+  // ── Human-readable pct string: never "-1% above", say "1% below" ──
+  const fmtVsMedian = (pct) => {
+    if (pct === null || pct === undefined) return null;
+    if (pct > 0)  return `${pct}% above market`;
+    if (pct < 0)  return `${Math.abs(pct)}% below market`;
+    return 'at market price';
+  };
+  const fmtVsAvg = (pct) => {
+    if (pct === null || pct === undefined) return null;
+    if (pct > 0)  return `${pct}% above tracked average`;
+    if (pct < 0)  return `${Math.abs(pct)}% below tracked average`;
+    return 'at tracked average';
+  };
 
-  // Holiday boost: if inside window or next event < 30 days, shift min down
-  const holidayBoost    = hCtx.insideWindow ? hCtx.activeDropPct : (hCtx.daysUntilNext <= 30 ? hCtx.nextEventDropPct * 0.6 : 0);
-  const holidayShift    = baseline * holidayBoost;
+  // ── Trend label — clean pill text ──
+  const trendLabel = {
+    'falling fast': 'Falling Fast', 'falling': 'Falling',
+    'rising fast':  'Rising Fast',  'rising':  'Rising',
+    'stable': 'Stable', 'unknown': null,
+  }[combined.trendDirection] || null;
 
-  let expectedMedian30d = Math.max(cur * 0.50, rawMedian30d);
-  let expectedMin30d    = Math.max(cur * 0.40, rawMedian30d - band - holidayShift);
-  let expectedMax30d    = rawMedian30d + band;
+  // ── Confidence label ──
+  const confLabel = combined.dataConfidenceScore >= 70 ? 'High'
+    : combined.dataConfidenceScore >= 40 ? 'Medium' : 'Low';
 
-  // Peer sanity clamp: if peers exist, clamp min to peerP25
-  if (nPeer >= 2) {
-    const peerSorted = [...peers].sort((a,b)=>a-b);
-    const peerP25 = percentile(peerSorted, 0.25);
-    const peerP75 = percentile(peerSorted, 0.75);
-    expectedMin30d    = Math.max(expectedMin30d, peerP25 * 0.90);
-    expectedMedian30d = Math.max(expectedMin30d, Math.min(expectedMedian30d, peerP75 * 1.05));
-  }
+  // ── Target price label — be precise about what the number means ──
+  // targetBuyPrice = realistic near-term buy target (peer median or holiday floor)
+  // expectedMin30d = model's 30-day low estimate (can be more aggressive)
+  // Only surface expectedMin30d if meaningfully different from targetBuyPrice
+  const targetDisplay  = combined.targetBuyPrice ? fmt(combined.targetBuyPrice) : null;
+  const floorDisplay   = (() => {
+    if (!combined.expectedMin30d) return null;
+    if (!combined.targetBuyPrice) return fmt(combined.expectedMin30d);
+    // Only show floor separately if it's >8% below target (otherwise redundant)
+    const diff = (combined.targetBuyPrice - combined.expectedMin30d) / combined.targetBuyPrice;
+    return diff >= 0.08 ? fmt(combined.expectedMin30d) : null;
+  })();
 
-  // Round to 2dp
-  expectedMin30d    = Math.round(expectedMin30d    * 100) / 100;
-  expectedMedian30d = Math.round(expectedMedian30d * 100) / 100;
-  expectedMax30d    = Math.round(expectedMax30d    * 100) / 100;
-
-  // ── Scoring ──────────────────────────────────────────────
-  // pricePosition: 0=at p25 (cheap), 1=at p75 (expensive)
-  const priceRange = (p75 - p25) || (p25 * 0.1);
-  const pricePosition = Math.max(0, Math.min(1, (cur - p25) / priceRange));
-
-  // Trend contribution: falling → buy signal (positive)
-  const trendSignal = slope < 0
-    ? Math.min(0.3, Math.abs(slope) / (baseline * 0.01 + 0.001)) // falling
-    : -Math.min(0.2, slope / (baseline * 0.01 + 0.001));          // rising
-
-  // Holiday boost to buy probability: inside window = strong buy, next<30d = moderate
-  const holidayBuyBoost = hCtx.insideWindow ? 0.25 : (hCtx.daysUntilNext <= 30 ? 0.12 : 0);
-
-  // Data confidence: more history/peers = more confident
-  const dataPts = nHist + nPeer;
-  const dataConf = dataPts >= 10 ? 0.3 : dataPts >= 5 ? 0.18 : dataPts >= 2 ? 0.08 : 0;
-
-  // buyNowProbability: high when price is low (high position), trending down, and no big event soon
-  // We want buy when: pricePosition is LOW (price near p25), trend neutral or rising, holiday not imminent
-  // Invert position: low price = high buy prob
-  const buySignal = (1 - pricePosition) * 0.5 + trendSignal * 0.3 + dataConf * 0.2;
-  const buyNowProbability = Math.max(0, Math.min(1, logistic((buySignal - 0.4) * 4)));
-
-  // dropProbability7d: high when trend falling or holiday window open
-  const dropSignal = (trendSignal > 0 ? trendSignal : 0) * 2 + holidayBuyBoost * 1.5 + (pricePosition > 0.7 ? 0.2 : 0);
-  const dropProbability7d = Math.max(0, Math.min(1, logistic((dropSignal - 0.3) * 3)));
-
-  // ── Verdict ──────────────────────────────────────────────
-  let verdict, action, reasons;
-  const aboveAvgPct  = allPrices.length ? Math.round((cur - baseline) / baseline * 100) : null;
-  const aboveLowPct  = histMin ? Math.round((cur - histMin) / histMin * 100) : null;
-  const trendDir     = slope < -baseline * 0.001 ? 'falling' : slope > baseline * 0.001 ? 'rising' : 'stable';
-
-  if (nHist === 0 && nPeer === 0) {
-    // No data at all — seasonal only
-    if (hCtx.insideWindow) {
-      verdict = 'BUY'; action = 'buy'; reasons = [`${hCtx.activeEvent} is active — typically one of the best times to buy`, 'No price history yet but seasonal timing is strong'];
-    } else if (hCtx.daysUntilNext <= 30) {
-      verdict = 'WAIT'; action = 'wait'; reasons = [`${hCtx.nextEvent} is only ${hCtx.daysUntilNext} days away — prices typically drop ${Math.round(hCtx.nextEventDropPct * 100)}%`, 'No price history yet to compare'];
-    } else {
-      verdict = 'FAIR'; action = 'ok'; reasons = ['First time tracking this product — building history', `Next major sale event: ${hCtx.nextEvent} in ${hCtx.monthsAway} month${hCtx.monthsAway !== 1 ? 's' : ''}`];
+  // ── Sale event — only surface if active or within 45 days, never null ──
+  const saleEvent = (() => {
+    if (hCtx.insideWindow && hCtx.activeEvent) {
+      return { name: hCtx.activeEvent, label: 'Active now', daysAway: 0 };
     }
-  } else if (hCtx.insideWindow && pricePosition > 0.5) {
-    verdict = 'WAIT'; action = 'wait';
-    reasons = [`${hCtx.activeEvent} sale window is open — wait for retailer price cuts`, 'Current price is in the upper range of what we\'ve seen'];
-  } else if (hCtx.insideWindow) {
-    verdict = 'BUY'; action = 'buy';
-    reasons = [`${hCtx.activeEvent} is active and price is near historical low`, 'Good timing to buy now'];
-  } else if (trendDir === 'falling' && slope < -baseline * 0.005) {
-    verdict = 'WATCH'; action = 'watch';
-    reasons = ['Price has been trending down recently', `Set an alert — it may drop further in the next ${HORIZON_DAYS} days`];
-  } else if (aboveLowPct !== null && aboveLowPct < 5) {
-    verdict = 'BUY'; action = 'buy';
-    reasons = ['Price is at or near its all-time tracked low', 'Unlikely to drop much further based on history'];
-  } else if (aboveAvgPct !== null && aboveAvgPct > 12 && hCtx.daysUntilNext <= 45) {
-    verdict = 'WAIT'; action = 'wait';
-    reasons = [`Currently ${aboveAvgPct}% above average tracked price`, `${hCtx.nextEvent} is ${hCtx.daysUntilNext} days away — expected ${Math.round(hCtx.nextEventDropPct * 100)}% drop`];
-  } else if (aboveAvgPct !== null && aboveAvgPct > 12) {
-    verdict = 'WAIT'; action = 'wait';
-    reasons = [`Currently ${aboveAvgPct}% above its average price`, 'Consider waiting for a price correction'];
-  } else {
-    verdict = 'FAIR'; action = 'ok';
-    reasons = ['Price is close to its typical range'];
-    if (hCtx.daysUntilNext <= 60) reasons.push(`${hCtx.nextEvent} in ${hCtx.monthsAway} month${hCtx.monthsAway !== 1 ? 's' : ''} could bring a ~${Math.round(hCtx.nextEventDropPct * 100)}% drop`);
-  }
+    if (hCtx.daysUntilNext <= 45 && hCtx.nextEvent) {
+      return {
+        name: hCtx.nextEvent,
+        label: nextEvtDate ? `${hCtx.nextEvent} · ${nextEvtDate}` : `${hCtx.nextEvent} · ${hCtx.daysUntilNext}d away`,
+        daysAway: hCtx.daysUntilNext,
+      };
+    }
+    return null; // hidden entirely — never show null text
+  })();
 
-  // ── Confidence score ──────────────────────────────────────
-  const dataPenalty = nHist === 0 ? -25 : nHist < 3 ? -15 : nHist < 6 ? -5 : 0;
-  const peerBonus   = nPeer >= 2 ? 8 : 0;
-  const volPenalty  = volatility > cur * 0.08 ? -10 : 0; // high volatility = less certain
-  const confidence  = Math.max(15, Math.min(92, 55 + dataPenalty + peerBonus + volPenalty));
+  // ── Subtitle — one clean line matching the verdict ──
+  const subtitle = {
+    'WAIT':  'Price looks elevated right now',
+    'WATCH': 'Price is moving — monitor before buying',
+    'BUY':   'Good time to buy',
+    'FAIR':  'Price is reasonable right now',
+  }[combined.verdict] || 'Price analysis';
 
-  // ── Template explanation ──────────────────────────────────
-  const fmt = p => moneyFmt(curr, p);
-  let reasoning = reasons[0] + (reasons[1] ? `. ${reasons[1]}` : '');
-  if (aboveAvgPct !== null) {
-    reasoning += nHist >= 3
-      ? ` The baseline price is around ${fmt(baseline)}.`
-      : `. Price baseline is around ${fmt(baseline)}.`;
-  }
-
-  // ── Optional Gemini explanation polish (async, cached, non-blocking) ──
-  const explKey = `expl:${storeId}:${storeProductId}:${verdict}`;
-  const cachedExpl = explanCache.get(explKey);
-  if (!cachedExpl && confidence >= 50 && process.env.GEMINI_KEY_REC) {
-    // Fire async — don't await, prediction returns immediately with template
-    const statsSnap = { baseline: fmt(baseline), ewma: fmt(ewma || baseline), min: histMin ? fmt(histMin) : 'N/A', max: histMax ? fmt(histMax) : 'N/A', nHist, nPeer };
-    const explPrompt = `You are a concise price analyst. Given this data about a product, write ONE natural-language sentence (max 30 words) explaining the price outlook.
-Product: "${(title || '').slice(0, 80)}"
-Verdict: ${verdict}
-Key stats: baseline=${statsSnap.baseline}, history points=${statsSnap.nHist}, next event=${hCtx.nextEvent} (${hCtx.daysUntilNext} days)
-Write one clear sentence only. No JSON, no formatting.`;
-    _geminiForPred('expl', explPrompt, 80).then(raw => {
-      if (raw && raw.length < 200) explanCache.set(explKey, raw.trim());
-    }).catch(() => {});
-  }
-  // Use cached Gemini explanation if available
-  const finalReasoning = cachedExpl || reasoning;
-
-  // ── Debug log ──────────────────────────────────────────────
-  if (DEBUG) {
-    console.log('[pred:debug]', JSON.stringify({
-      titleShort: (title||'').slice(0,40), category: cat, brand: attrs.brand,
-      nHist, nPeer, ewma: Math.round(baseline*100)/100,
-      slope: Math.round(slope*1000)/1000, volatility: Math.round(volatility*100)/100,
-      holidayActive: hCtx.activeEvent, holidayNext: hCtx.nextEvent,
-      holidayBoost: Math.round(holidayBoost*100), pricePosition: Math.round(pricePosition*100)/100,
-      buyNowProbability: Math.round(buyNowProbability*100)/100,
-      dropProbability7d: Math.round(dropProbability7d*100)/100,
-      verdict, confidence,
-    }));
-  }
+  // ── card: structured display object for the frontend ──
+  // Every field is either a clean string or null (never undefined, never raw number)
+  const card = {
+    verdict:        combined.verdict,
+    subtitle,
+    // Data rows — frontend renders as label: value pairs, skips nulls
+    currentPrice:   fmt(cur),
+    marketMedian:   nPeer >= 1 ? `${fmt(mktMedian)} across ${allMarket.length} stores` : null,
+    trackedAverage: signals.baseline && nHist >= 3 ? fmt(signals.baseline) : null,
+    trend:          trendLabel,
+    confidence:     confLabel,
+    // Position summary — human readable, no raw numbers
+    vsMarket:       combined.vsMedianPct !== null ? fmtVsMedian(combined.vsMedianPct) : null,
+    vsAverage:      combined.aboveAvgPct  !== null ? fmtVsAvg(combined.aboveAvgPct)   : null,
+    // Short explanation — 1-2 sentences, no raw %/numbers repeated from rows above
+    explanation:    combined.reasoning,
+    // Price targets — labeled precisely
+    targetBuyPrice: targetDisplay,   // realistic near-term entry
+    lowEndEstimate: floorDisplay,    // bear-case floor, only if meaningfully lower
+    // Sale event — null means don't render the row at all
+    saleEvent,
+    // Window
+    predictionWindow: '30 days',
+  };
 
   const result = {
-    // ── Legacy fields (keep renderPredictionCard working unchanged) ──
-    verdict, action, reasoning: finalReasoning,
-    predictedLow:    expectedMin30d < cur ? expectedMin30d : null,
-    nextSaleEvent:   hCtx.nextSaleEvent,
-    monthsAway:      hCtx.monthsAway,
-    aboveAvgPct,
-    aboveLowPct,
-    trendDirection:  trendDir,
-    historyCount:    nHist,
-    // ── New structured fields ──
-    buyNowProbability,
-    dropProbability7d,
-    expectedMin30d,
-    expectedMedian30d,
-    expectedMax30d,
-    confidence,
-    reasons,
-    explanation:     finalReasoning,
-    seasonality: {
-      nextEvent:         hCtx.nextEvent,
-      windowDays:        hCtx.daysUntilNext,
-      expectedImpactPct: Math.round(hCtx.nextEventDropPct * 100),
-      activeEvent:       hCtx.activeEvent,
+    // ── Primary fields ──
+    verdict:              combined.verdict,
+    action:               combined.action,
+    reasoning:            combined.reasoning,
+    explanation:          combined.reasoning,
+    trendDirection:       combined.trendDirection,
+    targetBuyPrice:       combined.targetBuyPrice,
+    predictedLow:         combined.predictedLow,
+    dropProbability30d:   combined.dropProbability30d,
+    dropProbability7d:    combined.dropProbability30d,
+    buyNowProbability:    combined.verdict === 'BUY' ? 0.75 : combined.verdict === 'WAIT' ? 0.18 : 0.45,
+    expectedMin30d:       combined.expectedMin30d,
+    expectedMedian30d:    combined.expectedMedian30d,
+    expectedMax30d:       combined.expectedMax30d,
+    expectedRange30d:     combined.expectedRange30d,
+    confidence:           combined.confidence,
+    dataConfidence:       combined.dataConfidence,
+    dataConfidenceScore:  combined.dataConfidenceScore,
+    forecastConfidence:   combined.forecastConfidence,
+    forecastConfidenceScore: combined.forecastConfidenceScore,
+    // ── Seasonal — null when > 45 days away, never exposed as raw null text ──
+    seasonalDriver:       combined.seasonalDriver,
+    nextSaleEvent:        saleEvent?.name || null,
+    monthsAway:           hCtx.daysUntilNext <= 45 ? null : hCtx.monthsAway, // suppressed when > 45d
+    // ── Position ──
+    aboveAvgPct:          combined.aboveAvgPct,
+    aboveLowPct:          combined.aboveLowPct,
+    vsMedianPct:          combined.vsMedianPct,
+    vsMedianLabel:        fmtVsMedian(combined.vsMedianPct),
+    vsAverageLabel:       fmtVsAvg(combined.aboveAvgPct),
+    // ── Context ──
+    historyCount:         nHist,
+    coldStart:            nHist < 5,
+    reasons:              [combined.reasoning],
+    marketIntel: nPeer >= 1 ? {
+      marketMedian:  fmt(mktMedian),
+      storeCount:    allMarket.length,
+      vsMedianPct:   combined.vsMedianPct !== null ? fmtVsMedian(combined.vsMedianPct) : null,
+      targetBuyPrice: targetDisplay,
+    } : null,
+    seasonality: saleEvent ? {
+      nextEvent:         saleEvent.name,
+      label:             saleEvent.label,
+      daysAway:          saleEvent.daysAway,
+      expectedImpactPct: combined.seasonalDriver ? Math.round(holiday.expectedDropDepthPct * 100) : 0,
+      activeEvent:       hCtx.activeEvent || null,
       insideWindow:      hCtx.insideWindow,
-    },
+      nextEventDate:     nextEvtDate || null,
+    } : null,
     stats: {
-      median:     Math.round(baseline * 100) / 100,
-      ewma:       Math.round((ewma || baseline) * 100) / 100,
-      slope:      Math.round(slope * 10000) / 10000,
-      volatility: Math.round(volatility * 100) / 100,
-      p25, p75,
-      nHistory:   nHist,
-      nPeers:     nPeer,
+      baseline:   combined.signals?.baseline ?? Math.round(mktMedian * 100)/100,
+      ewma:       Math.round((signals.baseline || cur) * 100)/100,
+      slope:      tf.slope,
+      volatility: tf.volatility,
+      spanDays:   tf.spanDays,
+      obsPerDay:  tf.obsPerDay,
+      p25:        nPeer >= 1 ? mktSorted[Math.floor(mktSorted.length*0.25)] : null,
+      p75:        nPeer >= 1 ? mktSorted[Math.floor(mktSorted.length*0.75)] : null,
+      nHistory:   nHist, nPeers: nPeer,
     },
     debug: {
-      usedHolidayBoost: holidayBoost > 0,
-      usedGeminiAttrs:  !(attrs.fromCache) && title?.length > 0,
-      usedPeers:        nPeer > 0,
-      usedHistory:      nHist > 0,
-      usedFallback:     nHist === 0 && nPeer === 0,
+      coldStart:      nHist < 5,
+      peerSignal:     combined.peerSignal,
+      vsMedianPct:    combined.vsMedianPct,
+      holidayGated:   hCtx.daysUntilNext > 45,
+      holidayDaysTo:  hCtx.daysUntilNext,
+      usedTimestamps: tf.reliable,
+      usedPeers:      nPeer > 0,
+      usedGemini:     false,
     },
+    // ── card: clean display object — frontend renders this, skipping null fields ──
+    card,
+    ui,
   };
 
   predCache.set(cKey, result);
   return result;
 }
 
-// ============================================================
-//  PRICE PREDICTION — seasonal + trend-based
-// ============================================================
-
-const SEASONAL_EVENTS = [
-  { month: 1,  name: "Post-Christmas clearance",  tipicalDrop: 0.10 },
-  { month: 2,  name: "Valentine's Day",           tipicalDrop: 0.07 },
-  { month: 5,  name: "Memorial Day (US)",         tipicalDrop: 0.08 },
-  { month: 7,  name: "Amazon Prime Day",          tipicalDrop: 0.18 },
-  { month: 8,  name: "Back to School",            tipicalDrop: 0.12 },
-  { month: 9,  name: "Back to School tail",       tipicalDrop: 0.08 },
-  { month: 11, name: "Black Friday",              tipicalDrop: 0.22 },
-  { month: 12, name: "Cyber Monday / Christmas",  tipicalDrop: 0.15 },
-];
-
-function getNextSaleEvent(fromDate = new Date()) {
-  const m = fromDate.getMonth() + 1; // 1-12
-  const d = fromDate.getDate();
-  // Find next event from now, wrapping into next year
-  const future = SEASONAL_EVENTS.filter(e => e.month > m || (e.month === m && d < 20));
-  const next = future.length ? future[0] : { ...SEASONAL_EVENTS[0], month: SEASONAL_EVENTS[0].month + 12 };
-  const monthsAway = next.month > m ? next.month - m : (12 - m) + next.month;
-  return { ...next, monthsAway };
-}
-
-function buildPricePrediction(currentPrice, stats, prices, historyRows) {
-  if (!currentPrice || !Number.isFinite(currentPrice)) return null;
-  const now = new Date();
-  const nextEvent = getNextSaleEvent(now);
-  const hasHistory = stats && prices.length >= 3;
-
-  // Trend: compare last 5 vs previous 5 (only if enough data)
-  let trendPct = 0;
-  if (prices.length >= 10) {
-    const recent = prices.slice(0, 5).reduce((a, b) => a + b, 0) / 5;
-    const older  = prices.slice(5, 10).reduce((a, b) => a + b, 0) / 5;
-    trendPct = (recent - older) / older;
-  }
-
-  const predictedDropPct = Math.max(nextEvent.tipicalDrop, 0.05);
-  const predictedSalePrice = Math.round(currentPrice * (1 - predictedDropPct) * 100) / 100;
-
-  let verdict, reasoning, action;
-
-  if (!hasHistory) {
-    // ── No history yet — use seasonal intelligence only ──
-    if (nextEvent.monthsAway <= 1) {
-      verdict = "WAIT"; action = "wait";
-      reasoning = `${nextEvent.name} is very close — typically one of the best times to buy electronics. Prices often drop ${Math.round(nextEvent.tipicalDrop * 100)}% around this time. Worth waiting a few weeks.`;
-    } else if (nextEvent.monthsAway <= 2) {
-      verdict = "WATCH"; action = "watch";
-      reasoning = `${nextEvent.name} is about ${nextEvent.monthsAway} months away — usually brings good discounts. We're still building price history for this product so I can't compare yet.`;
-    } else {
-      verdict = "FAIR"; action = "ok";
-      reasoning = `No price history yet — this is the first time we've seen this product. I can't compare it to past prices yet. Next big sale event is ${nextEvent.name} in ${nextEvent.monthsAway} months.`;
-    }
-  } else {
-    // ── Has history — full analysis ──
-    const aboveAvgPct = (currentPrice - stats.avg) / stats.avg;
-    const aboveLowPct = (currentPrice - stats.min) / stats.min;
-
-    if (aboveAvgPct > 0.12 && nextEvent.monthsAway <= 3) {
-      verdict = "WAIT"; action = "wait";
-      reasoning = `This is ${Math.round(aboveAvgPct * 100)}% above its average price. ${nextEvent.name} is ${nextEvent.monthsAway <= 1 ? "next month" : `${nextEvent.monthsAway} months away`} — prices on this type of product typically drop ${Math.round(nextEvent.tipicalDrop * 100)}% around that time.`;
-    } else if (aboveLowPct < 0.05) {
-      verdict = "BUY"; action = "buy";
-      reasoning = `This is essentially at its historical floor (only ${Math.round(aboveLowPct * 100)}% above the all-time low). Unlikely to drop much further.`;
-    } else if (trendPct < -0.04) {
-      verdict = "WATCH"; action = "watch";
-      reasoning = `Price has been falling recently (${Math.round(Math.abs(trendPct) * 100)}% drop in recent observations). Set an alert and wait a bit longer.`;
-    } else if (nextEvent.monthsAway <= 1) {
-      verdict = "WAIT"; action = "wait";
-      reasoning = `${nextEvent.name} is very close — usually one of the best times to buy. Hold off a few weeks.`;
-    } else {
-      verdict = "FAIR"; action = "ok";
-      reasoning = `Price is close to the historical average. No major sale expected for ${nextEvent.monthsAway} months. Fine to buy now if you need it.`;
-    }
-
-    return {
-      verdict, action, reasoning,
-      predictedLow: predictedSalePrice < currentPrice ? predictedSalePrice : null,
-      nextSaleEvent: nextEvent.name,
-      monthsAway: nextEvent.monthsAway,
-      aboveAvgPct: Math.round(aboveAvgPct * 100),
-      aboveLowPct: Math.round(aboveLowPct * 100),
-      trendDirection: trendPct < -0.04 ? "falling" : trendPct > 0.04 ? "rising" : "stable",
-      historyCount: prices.length,
-    };
-  }
-
-  // Seasonal-only verdict (no history)
-  return {
-    verdict, action, reasoning,
-    predictedLow: predictedSalePrice < currentPrice ? predictedSalePrice : null,
-    nextSaleEvent: nextEvent.name,
-    monthsAway: nextEvent.monthsAway,
-    aboveAvgPct: null,
-    aboveLowPct: null,
-    trendDirection: "unknown",
-    historyCount: prices.length,
-  };
-}
-
-// Attach prediction to product GET endpoint — we'll call it in /v1/products too
-// ============================================================
-//  WHATSAPP ALERTS — CallMeBot sender
-// ============================================================
 
 async function sendWhatsAppAlert({ whatsapp, callmebotKey, message }) {
   try {
@@ -5515,6 +5940,749 @@ Use this knowledge when giving BUY/WAIT advice.
 
   res.json({ ok: true, reply: fallback, actionSuggestions: [], followupQuestions: [], buyNowProbability: null, confidence: 30, stats, deals });
 });
+
+
+// ============================================================
+//  PREDICTION EVIDENCE SYSTEM
+//  Logging · Delayed evaluation · Backtesting · Trust reporting
+//  Answers: "Can we prove this predictor is accurate enough?"
+// ============================================================
+
+// ── SQL SCHEMA (run once in Supabase) ──────────────────────────
+// Keep here as documentation and for migration scripts.
+const PREDICTION_SCHEMA_SQL = `
+-- Table 1: exact snapshot of every prediction shown to a user
+CREATE TABLE IF NOT EXISTS prediction_logs (
+  id                    uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  store                 text NOT NULL,
+  store_product_id      text NOT NULL,
+  canonical_product_id  uuid,
+  url                   text,
+  title_snapshot        text,
+  category              text,
+  brand                 text,
+  predicted_at          timestamptz NOT NULL DEFAULT now(),
+  current_price         numeric(12,4) NOT NULL,
+  currency              text NOT NULL DEFAULT 'USD',
+  verdict               text NOT NULL,           -- BUY | WAIT | WATCH | FAIR | UNCERTAIN
+  trend_direction       text,                    -- falling | rising | stable | unknown
+  prediction_window_days int NOT NULL DEFAULT 30,
+  target_buy_price      numeric(12,4),
+  expected_min_30d      numeric(12,4),
+  expected_median_30d   numeric(12,4),
+  expected_max_30d      numeric(12,4),
+  drop_probability_30d  numeric(5,4),
+  confidence_score      int,
+  confidence_label      text,
+  data_confidence       text,
+  forecast_confidence   text,
+  history_points_count  int NOT NULL DEFAULT 0,
+  peer_count            int NOT NULL DEFAULT 0,
+  baseline_price        numeric(12,4),
+  seasonal_driver_json  jsonb,
+  raw_prediction_json   jsonb NOT NULL,
+  model_version         text NOT NULL DEFAULT 'v3'
+);
+
+CREATE INDEX IF NOT EXISTS idx_pred_logs_store     ON prediction_logs(store, store_product_id);
+CREATE INDEX IF NOT EXISTS idx_pred_logs_predicted  ON prediction_logs(predicted_at);
+CREATE INDEX IF NOT EXISTS idx_pred_logs_verdict    ON prediction_logs(verdict);
+CREATE INDEX IF NOT EXISTS idx_pred_logs_category   ON prediction_logs(category);
+
+-- Table 2: what actually happened in the 30-day window
+CREATE TABLE IF NOT EXISTS prediction_outcomes (
+  id                    uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  prediction_log_id     uuid NOT NULL REFERENCES prediction_logs(id),
+  evaluated_at          timestamptz NOT NULL DEFAULT now(),
+  window_days           int NOT NULL DEFAULT 30,
+  future_min_price      numeric(12,4),
+  future_median_price   numeric(12,4),
+  future_max_price      numeric(12,4),
+  future_final_price    numeric(12,4),
+  best_price_day_offset int,
+  did_drop_meaningfully boolean,
+  did_hit_target_buy_price boolean,
+  decision_correct      boolean,
+  direction_correct     boolean,
+  range_hit             boolean,
+  calibration_bucket    text,
+  notes_json            jsonb
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pred_outcomes_log ON prediction_outcomes(prediction_log_id);
+`;
+
+// ── PART 1: Accuracy definitions (deterministic, auditable) ───
+
+// "Meaningfully better price" = at least 3% OR $15 lower, whichever is greater.
+function isMeaningfulDrop(currentPrice, observedPrice) {
+  const pctThreshold = currentPrice * 0.03;
+  const absThreshold = 15;
+  const threshold    = Math.max(pctThreshold, absThreshold);
+  return (currentPrice - observedPrice) >= threshold;
+}
+
+// Was the WAIT/WATCH verdict correct? (did a meaningful drop appear within 30d?)
+// Was the BUY verdict correct? (did no meaningful drop appear within 30d?)
+function decisionCorrect(prediction, futurePrices) {
+  const { verdict, current_price } = prediction;
+  if (!futurePrices || futurePrices.length === 0) return null; // insufficient data
+  const anyDrop = futurePrices.some(p => isMeaningfulDrop(current_price, p));
+  if (verdict === 'WAIT' || verdict === 'WATCH') return anyDrop;
+  if (verdict === 'BUY')                         return !anyDrop;
+  if (verdict === 'FAIR')                        return !anyDrop; // treat FAIR as soft buy
+  return null; // UNCERTAIN excluded
+}
+
+// Did the trend direction match what actually happened?
+function directionCorrect(prediction, futurePrices) {
+  const { trend_direction, current_price } = prediction;
+  if (!futurePrices || futurePrices.length < 3) return null;
+  const futureAvg  = futurePrices.reduce((a,b)=>a+b,0) / futurePrices.length;
+  const actualDir  = futureAvg < current_price * 0.98 ? 'falling'
+    : futureAvg > current_price * 1.02 ? 'rising'
+    : 'stable';
+  const predicted = (trend_direction || '').replace(' fast', '');
+  return predicted === actualDir;
+}
+
+// Did actual prices fall within expected_min_30d .. expected_max_30d?
+function rangeHit(prediction, futurePrices) {
+  const { expected_min_30d, expected_max_30d } = prediction;
+  if (!futurePrices || futurePrices.length === 0) return null;
+  if (!expected_min_30d || !expected_max_30d)      return null;
+  const futureMin = Math.min(...futurePrices);
+  const futureMax = Math.max(...futurePrices);
+  // At least partial overlap between predicted range and observed range
+  return futureMax >= Number(expected_min_30d) && futureMin <= Number(expected_max_30d);
+}
+
+// Did the product actually hit the target buy price within 30 days?
+function targetBuyPriceHit(prediction, futurePrices) {
+  const { target_buy_price } = prediction;
+  if (!target_buy_price || !futurePrices || futurePrices.length === 0) return null;
+  return futurePrices.some(p => p <= Number(target_buy_price));
+}
+
+// Bucket 0-20, 21-40, 41-60, 61-80, 81-100
+function assignCalibrationBucket(prob) {
+  if (!prob && prob !== 0) return null;
+  const pct = Math.round(prob * 100);
+  if (pct <= 20)  return '0-20';
+  if (pct <= 40)  return '21-40';
+  if (pct <= 60)  return '41-60';
+  if (pct <= 80)  return '61-80';
+  return '81-100';
+}
+
+// ── PART 2: Log a prediction ───────────────────────────────────
+// Called immediately after computePredictionV2 returns.
+// Fire-and-forget — never blocks the user response.
+async function logPrediction({ storeId, storeProductId, url, title, category, brand,
+    currentPrice, currency, prediction, attrs }) {
+  try {
+    if (!prediction || !prediction.verdict) return;
+
+    // Fetch canonical product id if available
+    const { data: prod } = await supabase
+      .from('products')
+      .select('id')
+      .eq('store_id', storeId)
+      .eq('store_product_id', storeProductId)
+      .maybeSingle();
+
+    const row = {
+      store:                storeId,
+      store_product_id:     storeProductId,
+      canonical_product_id: prod?.id || null,
+      url:                  url || null,
+      title_snapshot:       (title || '').slice(0, 500),
+      category:             category || attrs?.category || null,
+      brand:                attrs?.brand || null,
+      predicted_at:         new Date().toISOString(),
+      current_price:        currentPrice,
+      currency:             currency || 'USD',
+      verdict:              prediction.verdict,
+      trend_direction:      prediction.trendDirection || null,
+      prediction_window_days: 30,
+      target_buy_price:     prediction.targetBuyPrice || null,
+      expected_min_30d:     prediction.expectedMin30d || null,
+      expected_median_30d:  prediction.expectedMedian30d || null,
+      expected_max_30d:     prediction.expectedMax30d || null,
+      drop_probability_30d: prediction.dropProbability30d || null,
+      confidence_score:     prediction.confidence || null,
+      confidence_label:     prediction.dataConfidence || null,
+      data_confidence:      prediction.dataConfidence || null,
+      forecast_confidence:  prediction.forecastConfidence || null,
+      history_points_count: prediction.historyCount || 0,
+      peer_count:           prediction.stats?.nPeers || 0,
+      baseline_price:       prediction.stats?.baseline || null,
+      seasonal_driver_json: prediction.seasonalDriver || null,
+      raw_prediction_json:  prediction,
+      model_version:        'v3',
+    };
+
+    const { error } = await supabase.from('prediction_logs').insert(row);
+    if (error) console.warn('[pred:log] insert failed:', error.message);
+
+  } catch (e) {
+    console.warn('[pred:log] error:', e.message);
+  }
+}
+
+// ── PART 3: Delayed evaluator (runs once per day) ──────────────
+async function runPredictionEvaluator() {
+  console.log('[eval] Starting prediction evaluator job...');
+  const WINDOW_DAYS   = 30;
+  const BATCH_SIZE    = 50;
+  const cutoff        = new Date(Date.now() - WINDOW_DAYS * 86400000).toISOString();
+
+  try {
+    // 1. Find predictions older than 30d with no outcome yet
+    const { data: logs, error: logErr } = await supabase
+      .from('prediction_logs')
+      .select('id, store, store_product_id, canonical_product_id, predicted_at, current_price, verdict, trend_direction, target_buy_price, expected_min_30d, expected_max_30d, drop_probability_30d')
+      .lt('predicted_at', cutoff)
+      .not('id', 'in', supabase.from('prediction_outcomes').select('prediction_log_id'))
+      .limit(BATCH_SIZE);
+
+    if (logErr) { console.warn('[eval] fetch logs error:', logErr.message); return; }
+    if (!logs || logs.length === 0) { console.log('[eval] No predictions ready for evaluation.'); return; }
+
+    console.log(`[eval] Evaluating ${logs.length} predictions...`);
+    let evaluated = 0, skipped = 0;
+
+    for (const log of logs) {
+      try {
+        const windowStart = new Date(log.predicted_at).toISOString();
+        const windowEnd   = new Date(new Date(log.predicted_at).getTime() + WINDOW_DAYS * 86400000).toISOString();
+
+        // 2. Pull price observations for this product in the 30d window after prediction
+        let obsQuery = supabase
+          .from('price_observations')
+          .select('price, observed_at')
+          .gte('observed_at', windowStart)
+          .lte('observed_at', windowEnd)
+          .order('observed_at', { ascending: true });
+
+        if (log.canonical_product_id) {
+          obsQuery = obsQuery.eq('product_id', log.canonical_product_id);
+        } else {
+          // Fall back to matching via products table
+          const { data: prod } = await supabase
+            .from('products')
+            .select('id')
+            .eq('store_id', log.store)
+            .eq('store_product_id', log.store_product_id)
+            .maybeSingle();
+          if (!prod) { skipped++; continue; }
+          obsQuery = obsQuery.eq('product_id', prod.id);
+        }
+
+        const { data: obs } = await obsQuery;
+        if (!obs || obs.length < 2) { skipped++; continue; } // need at least 2 observations
+
+        const futurePrices = obs.map(r => Number(r.price)).filter(n => Number.isFinite(n) && n > 0);
+        if (futurePrices.length < 2) { skipped++; continue; }
+
+        // 3. Compute future stats
+        const sortedFuture   = [...futurePrices].sort((a,b) => a - b);
+        const futureMin      = sortedFuture[0];
+        const futureMax      = sortedFuture[sortedFuture.length - 1];
+        const futureMedian   = sortedFuture[Math.floor(sortedFuture.length / 2)];
+        const futureFinal    = futurePrices[futurePrices.length - 1];
+
+        // Best price day offset (how many days into the window was the lowest price?)
+        const minIdx         = futurePrices.indexOf(futureMin);
+        const minObsDate     = obs[minIdx]?.observed_at;
+        const bestDayOffset  = minObsDate
+          ? Math.round((new Date(minObsDate) - new Date(log.predicted_at)) / 86400000)
+          : null;
+
+        // 4. Score
+        const didDrop    = decisionCorrect(log, futurePrices);
+        const dirOk      = directionCorrect(log, futurePrices);
+        const rangeOk    = rangeHit(log, futurePrices);
+        const targetOk   = targetBuyPriceHit(log, futurePrices);
+        const calBucket  = assignCalibrationBucket(log.drop_probability_30d);
+
+        // 5. Insert outcome
+        const { error: outErr } = await supabase.from('prediction_outcomes').insert({
+          prediction_log_id:       log.id,
+          evaluated_at:            new Date().toISOString(),
+          window_days:             WINDOW_DAYS,
+          future_min_price:        futureMin,
+          future_median_price:     futureMedian,
+          future_max_price:        futureMax,
+          future_final_price:      futureFinal,
+          best_price_day_offset:   bestDayOffset,
+          did_drop_meaningfully:   futurePrices.some(p => isMeaningfulDrop(log.current_price, p)),
+          did_hit_target_buy_price: targetOk,
+          decision_correct:        didDrop,
+          direction_correct:       dirOk,
+          range_hit:               rangeOk,
+          calibration_bucket:      calBucket,
+          notes_json: {
+            obs_count:    futurePrices.length,
+            future_min:   futureMin,
+            current_price: log.current_price,
+            drop_pct:     Math.round((log.current_price - futureMin) / log.current_price * 100),
+          },
+        });
+
+        if (outErr) console.warn(`[eval] outcome insert error for ${log.id}:`, outErr.message);
+        else evaluated++;
+
+      } catch (e) {
+        console.warn(`[eval] error on log ${log.id}:`, e.message);
+        skipped++;
+      }
+    }
+    console.log(`[eval] Done. Evaluated: ${evaluated}, Skipped: ${skipped}`);
+  } catch (e) {
+    console.error('[eval] fatal error:', e.message);
+  }
+}
+
+// ── Schedule evaluator: runs daily at 03:00 server time ────────
+function scheduleDailyEvaluator() {
+  const MS_IN_DAY = 86400000;
+  const now       = new Date();
+  const next3am   = new Date(now);
+  next3am.setHours(3, 0, 0, 0);
+  if (next3am <= now) next3am.setTime(next3am.getTime() + MS_IN_DAY);
+  const msUntil3am = next3am - now;
+  setTimeout(() => {
+    runPredictionEvaluator().catch(e => console.error('[eval] scheduler error:', e.message));
+    setInterval(() => {
+      runPredictionEvaluator().catch(e => console.error('[eval] scheduler error:', e.message));
+    }, MS_IN_DAY);
+  }, msUntil3am);
+  console.log(`[eval] Evaluator scheduled. First run in ${Math.round(msUntil3am/3600000)}h.`);
+}
+scheduleDailyEvaluator();
+
+// ── PART 4: Backtester ─────────────────────────────────────────
+// Runs the predictor on historical cutoff dates and scores against real future data.
+// Called via admin endpoint — not on every request.
+async function runBacktest({ storeId, storeProductId, cutoffDate, windowDays = 30 }) {
+  const cutoff = new Date(cutoffDate);
+  const windowEnd = new Date(cutoff.getTime() + windowDays * 86400000);
+
+  // Pull history UP TO cutoff (no leakage)
+  const { data: prod } = await supabase
+    .from('products')
+    .select('id, title, currency, last_price')
+    .eq('store_id', storeId)
+    .eq('store_product_id', storeProductId)
+    .maybeSingle();
+  if (!prod) return { error: 'product_not_found' };
+
+  const { data: histRows } = await supabase
+    .from('price_observations')
+    .select('price, observed_at')
+    .eq('product_id', prod.id)
+    .lt('observed_at', cutoff.toISOString())
+    .order('observed_at', { ascending: false })
+    .limit(120);
+
+  if (!histRows || histRows.length === 0) return { error: 'no_history_before_cutoff' };
+
+  const currentPriceAtCutoff = Number(histRows[0].price);
+  const historyPrices = histRows.map(r => Number(r.price)).filter(Number.isFinite);
+
+  // Run predictor with cutoff as "now" (no future data)
+  const prediction = await computePredictionV2({
+    title: prod.title || '',
+    currentPrice: currentPriceAtCutoff,
+    currency: prod.currency || 'USD',
+    storeId, storeProductId,
+    historyRows,
+    historyPrices,
+    peerPrices: [],  // no peers in backtest (conservative)
+    now: cutoff,
+  });
+
+  if (!prediction) return { error: 'prediction_failed' };
+
+  // Pull FUTURE observations (30d after cutoff) for scoring
+  const { data: futureRows } = await supabase
+    .from('price_observations')
+    .select('price, observed_at')
+    .eq('product_id', prod.id)
+    .gte('observed_at', cutoff.toISOString())
+    .lte('observed_at', windowEnd.toISOString())
+    .order('observed_at', { ascending: true });
+
+  if (!futureRows || futureRows.length < 2) return { error: 'insufficient_future_data', prediction };
+
+  const futurePrices = futureRows.map(r => Number(r.price)).filter(Number.isFinite);
+  const sortedF = [...futurePrices].sort((a,b) => a - b);
+
+  const syntheticLog = {
+    verdict:           prediction.verdict,
+    trend_direction:   prediction.trendDirection,
+    current_price:     currentPriceAtCutoff,
+    target_buy_price:  prediction.targetBuyPrice,
+    expected_min_30d:  prediction.expectedMin30d,
+    expected_max_30d:  prediction.expectedMax30d,
+    drop_probability_30d: prediction.dropProbability30d,
+  };
+
+  return {
+    cutoffDate:       cutoff.toISOString(),
+    currentPrice:     currentPriceAtCutoff,
+    verdict:          prediction.verdict,
+    trendDirection:   prediction.trendDirection,
+    targetBuyPrice:   prediction.targetBuyPrice,
+    confidence:       prediction.confidence,
+    futureMin:        sortedF[0],
+    futureFinal:      futurePrices[futurePrices.length - 1],
+    futureObs:        futurePrices.length,
+    decisionCorrect:  decisionCorrect(syntheticLog, futurePrices),
+    directionCorrect: directionCorrect(syntheticLog, futurePrices),
+    rangeHit:         rangeHit(syntheticLog, futurePrices),
+    targetHit:        targetBuyPriceHit(syntheticLog, futurePrices),
+    didDropMeaningfully: futurePrices.some(p => isMeaningfulDrop(currentPriceAtCutoff, p)),
+    calibrationBucket: assignCalibrationBucket(prediction.dropProbability30d),
+  };
+}
+
+// ── PART 5: Trust report generator ────────────────────────────
+// Returns a structured evidence report with calibration, accuracy by slice,
+// and a plain-English "Can we make a trust claim?" section.
+async function generateTrustReport({ minCount = 20 } = {}) {
+  // Fetch evaluated predictions with outcomes joined
+  const { data: rows, error } = await supabase
+    .from('prediction_logs')
+    .select(`
+      id, verdict, trend_direction, category, confidence_score,
+      confidence_label, data_confidence, history_points_count,
+      peer_count, drop_probability_30d, current_price, store,
+      predicted_at,
+      prediction_outcomes (
+        decision_correct, direction_correct, range_hit,
+        did_hit_target_buy_price, did_drop_meaningfully,
+        calibration_bucket, future_min_price, future_final_price
+      )
+    `)
+    .not('prediction_outcomes', 'is', null)
+    .limit(5000);
+
+  if (error) return { error: error.message };
+
+  // Flatten: one row per evaluated prediction
+  const evaluated = (rows || [])
+    .map(r => ({ ...r, outcome: r.prediction_outcomes?.[0] }))
+    .filter(r => r.outcome && r.outcome.decision_correct !== null);
+
+  if (evaluated.length < minCount) {
+    return {
+      status: 'insufficient_data',
+      total_evaluated: evaluated.length,
+      message: `Only ${evaluated.length} evaluated predictions. Need at least ${minCount} to report.`,
+    };
+  }
+
+  // ── Core metric helpers ──
+  const pct = (arr, key) => {
+    const valid = arr.filter(r => r.outcome[key] !== null);
+    if (!valid.length) return null;
+    return Math.round(valid.filter(r => r.outcome[key] === true).length / valid.length * 1000) / 10;
+  };
+  const avg = (arr, key) => {
+    const vals = arr.map(r => Number(r[key])).filter(Number.isFinite);
+    return vals.length ? Math.round(vals.reduce((a,b)=>a+b,0) / vals.length * 10) / 10 : null;
+  };
+
+  // ── Overall accuracy ──
+  const overall = {
+    total:             evaluated.length,
+    decisionAccuracy:  pct(evaluated, 'decision_correct'),
+    directionAccuracy: pct(evaluated, 'direction_correct'),
+    rangeHitRate:      pct(evaluated, 'range_hit'),
+    targetHitRate:     pct(evaluated, 'did_hit_target_buy_price'),
+    dropRate:          pct(evaluated, 'did_drop_meaningfully'),
+  };
+
+  // ── Accuracy by confidence band ──
+  const confBands = ['Low', 'Medium', 'High'];
+  const byConfidence = {};
+  for (const band of confBands) {
+    const slice = evaluated.filter(r => r.confidence_label === band || r.data_confidence === band);
+    if (slice.length < 5) continue;
+    byConfidence[band] = {
+      count:            slice.length,
+      decisionAccuracy: pct(slice, 'decision_correct'),
+      directionAccuracy:pct(slice, 'direction_correct'),
+      rangeHitRate:     pct(slice, 'range_hit'),
+    };
+  }
+
+  // Check confidence ordering (High > Medium > Low)
+  const confOrdering = (() => {
+    const h = byConfidence['High']?.decisionAccuracy;
+    const m = byConfidence['Medium']?.decisionAccuracy;
+    const l = byConfidence['Low']?.decisionAccuracy;
+    if (h === null || m === null || l === null) return 'insufficient_data';
+    return (h >= m && m >= l) ? 'valid' : 'INVALID';
+  })();
+
+  // ── Calibration by drop probability bucket ──
+  const buckets = ['0-20','21-40','41-60','61-80','81-100'];
+  const calibration = {};
+  for (const bucket of buckets) {
+    const slice = evaluated.filter(r => r.outcome.calibration_bucket === bucket);
+    if (!slice.length) continue;
+    const avgPredProb = avg(slice, 'drop_probability_30d') || 0;
+    const actualRate  = pct(slice, 'did_drop_meaningfully') || 0;
+    calibration[bucket] = {
+      count:         slice.length,
+      avgPredictedProb: Math.round(avgPredProb * 100),
+      actualDropRate:   actualRate,
+      error:            Math.round(Math.abs(avgPredProb * 100 - actualRate) * 10) / 10,
+    };
+  }
+
+  // ── Accuracy by category ──
+  const categories = [...new Set(evaluated.map(r => r.category).filter(Boolean))];
+  const byCategory = {};
+  for (const cat of categories) {
+    const slice = evaluated.filter(r => r.category === cat);
+    if (slice.length < 5) continue;
+    byCategory[cat] = {
+      count:            slice.length,
+      decisionAccuracy: pct(slice, 'decision_correct'),
+    };
+  }
+
+  // ── History bucket performance ──
+  const byHistoryBucket = {
+    'cold (0-4)':   { slice: evaluated.filter(r => r.history_points_count < 5) },
+    'sparse (5-14)':{ slice: evaluated.filter(r => r.history_points_count >= 5 && r.history_points_count < 15) },
+    'rich (15+)':   { slice: evaluated.filter(r => r.history_points_count >= 15) },
+  };
+  for (const [k, v] of Object.entries(byHistoryBucket)) {
+    byHistoryBucket[k] = {
+      count:            v.slice.length,
+      decisionAccuracy: pct(v.slice, 'decision_correct'),
+    };
+  }
+
+  // ── Holiday period performance ──
+  // "near holiday" = seasonalDriver existed (was logged)
+  // We don't have that in the join, so proxy with: pull seasonal_driver_json from logs
+  // For now: mark all evaluated as "any" — holiday slice available via SQL view
+
+  // ── "Can we make a trust claim?" ──
+  const highConfSlice = evaluated.filter(r =>
+    (r.confidence_label === 'High' || r.data_confidence === 'High') &&
+    r.history_points_count >= 10
+  );
+  const highConfElec  = highConfSlice.filter(r => r.category === 'electronics');
+  const claimDA       = byConfidence['High']?.decisionAccuracy;
+  const calibMaxError = Math.max(...Object.values(calibration).map(b => b.error || 0));
+  const confOrderOk   = confOrdering === 'valid';
+
+  const trustClaim = (() => {
+    if (!claimDA)         return { canClaim: false, reason: 'Insufficient high-confidence data.' };
+    if (claimDA >= 80 && confOrderOk && calibMaxError <= 15) {
+      return {
+        canClaim: true,
+        claim: `Decision accuracy is ${claimDA}% on high-confidence predictions with 10+ history points.`,
+        details: [
+          'Confidence ordering is valid (High > Medium > Low).',
+          `Calibration max error: ${calibMaxError}% — acceptable.`,
+          'Safe to surface as evidence-backed guidance on high-confidence predictions.',
+        ],
+      };
+    }
+    if (claimDA >= 70 && confOrderOk) {
+      return {
+        canClaim: true,
+        claim: `Decision accuracy is ${claimDA}% — acceptable but not strong.`,
+        details: [
+          confOrderOk ? 'Confidence ordering is valid.' : 'WARNING: Confidence ordering is INVALID.',
+          calibMaxError > 15 ? `Calibration error ${calibMaxError}% is high — avoid showing precise drop probabilities.` : 'Calibration acceptable.',
+          'Use measured language. Do not claim >80% accuracy.',
+        ],
+      };
+    }
+    return {
+      canClaim: false,
+      reason: `Decision accuracy is only ${claimDA}% — below trust threshold.`,
+      details: [
+        confOrderOk ? 'Confidence ordering is valid.' : 'WARNING: Confidence ordering INVALID — confidence ratings are not trustworthy.',
+        calibMaxError > 15 ? `Calibration is poor (max error: ${calibMaxError}%). Do not show precise probabilities.` : '',
+        'Cold-start performance may be weak — consider suppressing hard verdicts with < 5 history points.',
+      ].filter(Boolean),
+    };
+  })();
+
+  return {
+    generatedAt:     new Date().toISOString(),
+    totalEvaluated:  evaluated.length,
+    overall,
+    byConfidence,
+    confidenceOrdering: confOrdering,
+    calibration,
+    byCategory,
+    byHistoryBucket,
+    trustClaim,
+  };
+}
+
+// ── PART 6: Live shipping rules (applied at prediction time) ───
+// Adjusts or suppresses prediction output based on accumulated evidence.
+// Initially conservative — tightens as we gather real accuracy data.
+function applyShippingRules(prediction, { nHist, nPeer, category } = {}) {
+  if (!prediction) return prediction;
+
+  const p = { ...prediction };
+
+  // Rule 1: No hard BUY with zero peer support and cold history
+  if (p.verdict === 'BUY' && nHist < 5 && nPeer === 0) {
+    p.verdict   = 'FAIR';
+    p.action    = 'ok';
+    p.reasoning = `Limited data (${nHist} observation${nHist !== 1 ? 's' : ''}, no peer prices) — treating as fair price rather than a confident buy signal. ${p.reasoning}`;
+    p.confidence = Math.min(p.confidence || 50, 42);
+    p._ruleApplied = 'no_buy_without_data';
+  }
+
+  // Rule 2: Never show precise drop probability text when confidence is Low
+  if ((p.dataConfidence === 'Low' || p.confidence < 40) && p.dropProbability30d !== null) {
+    p.dropProbability30d = null;  // suppressed — not earned
+    p._probSuppressed = true;
+  }
+
+  // Rule 3: Suppress seasonalDriver if data_confidence is Low
+  // (holiday signal alone with no price history = noise)
+  if (p.dataConfidence === 'Low' && p.seasonalDriver && nHist < 3) {
+    p.seasonalDriver = null;
+    p._seasonalSuppressed = true;
+  }
+
+  // Rule 4: Cap confidence score for cold-start at 55
+  if (nHist < 5 && (p.confidence || 0) > 55) {
+    p.confidence         = 55;
+    p.dataConfidenceScore = Math.min(p.dataConfidenceScore || 55, 55);
+  }
+
+  return p;
+}
+
+// ── PART 7: Admin endpoints ────────────────────────────────────
+
+// GET /v1/admin/trust-report — full evidence report
+app.get('/v1/admin/trust-report', async (req, res) => {
+  // Simple bearer token gate — set ADMIN_KEY in env
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (process.env.ADMIN_KEY && key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const report = await generateTrustReport();
+    res.json({ ok: true, report });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /v1/admin/backtest — run backtest for one product + cutoff
+app.post('/v1/admin/backtest', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (process.env.ADMIN_KEY && key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const { storeId, storeProductId, cutoffDate, windowDays } = req.body;
+  if (!storeId || !storeProductId || !cutoffDate) {
+    return res.status(400).json({ error: 'storeId, storeProductId, cutoffDate required' });
+  }
+  try {
+    const result = await runBacktest({ storeId, storeProductId, cutoffDate, windowDays });
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /v1/admin/evaluate-now — trigger evaluator manually
+app.post('/v1/admin/evaluate-now', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (process.env.ADMIN_KEY && key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  runPredictionEvaluator().catch(e => console.error('[eval] manual trigger error:', e.message));
+  res.json({ ok: true, message: 'Evaluator started in background.' });
+});
+
+// GET /v1/admin/schema-sql — return the SQL to run in Supabase
+app.get('/v1/admin/schema-sql', (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (process.env.ADMIN_KEY && key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  res.type('text/plain').send(PREDICTION_SCHEMA_SQL);
+});
+
+// ── Useful SQL views (for direct Supabase queries) ─────────────
+// Run these in your Supabase SQL editor after creating the tables above.
+const REPORTING_VIEWS_SQL = `
+-- Overall decision accuracy
+SELECT
+  COUNT(*) AS total,
+  ROUND(100.0 * SUM(CASE WHEN o.decision_correct THEN 1 ELSE 0 END) / COUNT(*), 1) AS decision_accuracy_pct,
+  ROUND(100.0 * SUM(CASE WHEN o.direction_correct THEN 1 ELSE 0 END) / COUNT(*), 1) AS direction_accuracy_pct,
+  ROUND(100.0 * SUM(CASE WHEN o.range_hit THEN 1 ELSE 0 END) / COUNT(*), 1) AS range_hit_pct
+FROM prediction_logs l
+JOIN prediction_outcomes o ON o.prediction_log_id = l.id
+WHERE o.decision_correct IS NOT NULL;
+
+-- Accuracy by category
+SELECT
+  l.category,
+  COUNT(*) AS total,
+  ROUND(100.0 * SUM(CASE WHEN o.decision_correct THEN 1 ELSE 0 END) / COUNT(*), 1) AS decision_accuracy_pct
+FROM prediction_logs l
+JOIN prediction_outcomes o ON o.prediction_log_id = l.id
+WHERE o.decision_correct IS NOT NULL
+GROUP BY l.category
+HAVING COUNT(*) >= 5
+ORDER BY decision_accuracy_pct DESC;
+
+-- Calibration by drop probability bucket
+SELECT
+  o.calibration_bucket,
+  COUNT(*) AS total,
+  ROUND(AVG(l.drop_probability_30d) * 100, 1) AS avg_predicted_pct,
+  ROUND(100.0 * SUM(CASE WHEN o.did_drop_meaningfully THEN 1 ELSE 0 END) / COUNT(*), 1) AS actual_drop_pct
+FROM prediction_logs l
+JOIN prediction_outcomes o ON o.prediction_log_id = l.id
+WHERE o.calibration_bucket IS NOT NULL
+GROUP BY o.calibration_bucket
+ORDER BY o.calibration_bucket;
+
+-- Accuracy by confidence band
+SELECT
+  l.confidence_label,
+  COUNT(*) AS total,
+  ROUND(100.0 * SUM(CASE WHEN o.decision_correct THEN 1 ELSE 0 END) / COUNT(*), 1) AS decision_accuracy_pct
+FROM prediction_logs l
+JOIN prediction_outcomes o ON o.prediction_log_id = l.id
+WHERE o.decision_correct IS NOT NULL AND l.confidence_label IS NOT NULL
+GROUP BY l.confidence_label
+ORDER BY decision_accuracy_pct DESC;
+
+-- Near-holiday vs non-holiday accuracy
+SELECT
+  CASE WHEN l.seasonal_driver_json IS NOT NULL THEN 'near_holiday' ELSE 'no_holiday' END AS period,
+  COUNT(*) AS total,
+  ROUND(100.0 * SUM(CASE WHEN o.decision_correct THEN 1 ELSE 0 END) / COUNT(*), 1) AS decision_accuracy_pct
+FROM prediction_logs l
+JOIN prediction_outcomes o ON o.prediction_log_id = l.id
+WHERE o.decision_correct IS NOT NULL
+GROUP BY 1;
+`;
 
 const port = process.env.PORT || 8787;
 app.listen(port, () => console.log(`Atheon API running on http://localhost:${port}`));
