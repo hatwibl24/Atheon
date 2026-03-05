@@ -4096,16 +4096,19 @@ const ObservationSchema = z.object({
   canonicalUrl: z.string().url().optional(), canonical_url: z.string().url().optional(),
   pageUrl: z.string().url().optional(), page_url: z.string().url().optional(),
   imageUrl: z.string().optional().nullable(), image_url: z.string().optional().nullable(),
-  title: z.string().optional().nullable(), price: z.number().positive(),
+  title: z.string().optional().nullable(), price: z.number().positive().optional().nullable(),
   currency: z.string().min(3).max(3).default("USD"),
   source: z.string().optional().default("extension"), host: z.string().optional().nullable(),
-  wasPrice: z.number().positive().optional().nullable()
+  wasPrice: z.number().positive().optional().nullable(),
+  priceSource: z.enum(["jsonld","corePrice","buybox","generic","none","unknown"]).optional().default("unknown"),
+  priceStatus: z.enum(["ok","hidden","unavailable","unknown"]).optional().default("unknown")
 }).transform(o => ({
   storeId: o.storeId ?? o.store_id, storeProductId: o.storeProductId ?? o.store_product_id,
   canonicalUrl: o.canonicalUrl ?? o.canonical_url, pageUrl: o.pageUrl ?? o.page_url,
   title: o.title ?? null, imageUrl: o.imageUrl ?? o.image_url ?? null,
-  price: o.price, currency: o.currency ?? "USD", source: o.source ?? "extension",
-  host: o.host ?? null, wasPrice: o.wasPrice ?? null
+  price: o.price ?? null, currency: o.currency ?? "USD", source: o.source ?? "extension",
+  host: o.host ?? null, wasPrice: o.wasPrice ?? null,
+  priceSource: o.priceSource ?? "unknown", priceStatus: o.priceStatus ?? "unknown"
 }));
 
 const AiChatSchema = z.object({
@@ -4334,6 +4337,23 @@ app.post("/v1/observations", async (req, res) => {
 
   const { data: storeRow } = await supabase.from("stores").select("id").eq("id", o.storeId).maybeSingle();
   if (!storeRow) return res.status(400).json({ error: "unknown_store" });
+
+  // ── Price trust gate ──────────────────────────────────────────────────────
+  // Reject hidden/unavailable prices — never store garbage in DB
+  if (o.priceStatus === "hidden" || o.priceStatus === "unavailable") {
+    console.log("[obs] price hidden for " + o.storeId + "/" + o.storeProductId + " — skipping");
+    return res.json({ ok: true, skipped: true, reason: "price_hidden", priceStatus: o.priceStatus });
+  }
+  if (o.price == null || !Number.isFinite(o.price) || o.price <= 0) {
+    return res.status(400).json({ error: "missing_price" });
+  }
+  // On Amazon, if priceSource is explicitly "none", the extraction gave up — skip
+  const _isAmazon = (o.storeId || "").toLowerCase().includes("amazon");
+  if (_isAmazon && o.priceSource === "none") {
+    console.log("[obs] Amazon priceSource=none — skipping storage");
+    return res.json({ ok: true, skipped: true, reason: "untrusted_price_source" });
+  }
+  // ── End price trust gate ──────────────────────────────────────────────────
 
   const { data: product, error: upsertErr } = await supabase.from("products").upsert({
     store_id: o.storeId, store_product_id: o.storeProductId,
