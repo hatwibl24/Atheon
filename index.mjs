@@ -4159,38 +4159,45 @@ app.get("/v1/extractor", async (req, res) => {
 //  BOOTSTRAP HISTORY — cold-start anchor point generator
 //
 //  When a product has < 3 real observations we synthesise up to
-//  3 plausible past anchor points (60d / 30d / 7d ago) and save
+//  3 plausible past anchor points (90d / 60d / 30d ago) and save
 //  them as source = 'estimated_history' in price_observations.
 //
 //  Rules:
 //  • Only fires if realCount < 3
 //  • Only inserts slots not already covered by existing estimates
 //  • Uses category-aware drift + holiday calendar
-//  • Peer prices provide weak baseline stabilisation
+//  • Real observations anchor the trajectory — interpolates between
+//    oldest known real price and current price rather than drifting
+//    blindly from current
+//  • Peer prices provide fallback anchor when no real obs exist
 //  • Frontend receives these as normal chart points (no label)
 //  • In-memory cache prevents re-querying DB for 24 h
 // ============================================================
 
 const _BOOT_PARAMS = {
-  phone:                 { drift: 0.025, vol: 0.25, peerW: 0.35, hSens: 0.60 },
-  tablet:                { drift: 0.020, vol: 0.22, peerW: 0.35, hSens: 0.55 },
-  game_console:          { drift: 0.012, vol: 0.15, peerW: 0.30, hSens: 0.45 },
-  gaming_controller:     { drift: 0.008, vol: 0.12, peerW: 0.25, hSens: 0.40 },
-  gaming_laptop:         { drift: 0.022, vol: 0.25, peerW: 0.30, hSens: 0.65 },
-  laptop:                { drift: 0.018, vol: 0.22, peerW: 0.30, hSens: 0.55 },
-  ultrabook:             { drift: 0.018, vol: 0.22, peerW: 0.30, hSens: 0.55 },
-  business_laptop:       { drift: 0.015, vol: 0.20, peerW: 0.30, hSens: 0.45 },
-  gaming_desktop:        { drift: 0.020, vol: 0.25, peerW: 0.28, hSens: 0.60 },
-  desktop:               { drift: 0.015, vol: 0.20, peerW: 0.28, hSens: 0.45 },
-  tws_earbuds:           { drift: 0.014, vol: 0.18, peerW: 0.35, hSens: 0.50 },
-  headphones:            { drift: 0.014, vol: 0.18, peerW: 0.35, hSens: 0.50 },
-  gaming_headset:        { drift: 0.012, vol: 0.18, peerW: 0.30, hSens: 0.45 },
-  smartwatch:            { drift: 0.016, vol: 0.20, peerW: 0.30, hSens: 0.50 },
-  smart_tv:              { drift: 0.025, vol: 0.28, peerW: 0.28, hSens: 0.60 },
-  monitor:               { drift: 0.015, vol: 0.20, peerW: 0.28, hSens: 0.50 },
-  software_subscription: { drift: 0.003, vol: 0.08, peerW: 0.20, hSens: 0.25 },
-  gpu:                   { drift: 0.022, vol: 0.30, peerW: 0.28, hSens: 0.55 },
-  generic:               { drift: 0.008, vol: 0.12, peerW: 0.20, hSens: 0.30 },
+  // drift  = monthly depreciation rate (price drop per 30d as fraction)
+  // vol    = max deviation cap from trajectory (fraction of current price)
+  // peerW  = how much peer median pulls the anchor (0=ignore, 1=full)
+  // hSens  = holiday price effect sensitivity
+  phone:                 { drift: 0.025, vol: 0.18, peerW: 0.40, hSens: 0.60 },
+  tablet:                { drift: 0.020, vol: 0.16, peerW: 0.40, hSens: 0.55 },
+  game_console:          { drift: 0.012, vol: 0.10, peerW: 0.35, hSens: 0.45 },
+  gaming_controller:     { drift: 0.008, vol: 0.08, peerW: 0.30, hSens: 0.40 },
+  gaming_laptop:         { drift: 0.022, vol: 0.18, peerW: 0.35, hSens: 0.65 },
+  laptop:                { drift: 0.018, vol: 0.16, peerW: 0.35, hSens: 0.55 },
+  ultrabook:             { drift: 0.018, vol: 0.16, peerW: 0.35, hSens: 0.55 },
+  business_laptop:       { drift: 0.015, vol: 0.14, peerW: 0.35, hSens: 0.45 },
+  gaming_desktop:        { drift: 0.020, vol: 0.18, peerW: 0.32, hSens: 0.60 },
+  desktop:               { drift: 0.015, vol: 0.14, peerW: 0.32, hSens: 0.45 },
+  tws_earbuds:           { drift: 0.014, vol: 0.14, peerW: 0.40, hSens: 0.50 },
+  headphones:            { drift: 0.014, vol: 0.14, peerW: 0.40, hSens: 0.50 },
+  gaming_headset:        { drift: 0.012, vol: 0.12, peerW: 0.35, hSens: 0.45 },
+  smartwatch:            { drift: 0.016, vol: 0.14, peerW: 0.35, hSens: 0.50 },
+  smart_tv:              { drift: 0.025, vol: 0.20, peerW: 0.32, hSens: 0.60 },
+  monitor:               { drift: 0.015, vol: 0.14, peerW: 0.32, hSens: 0.50 },
+  software_subscription: { drift: 0.003, vol: 0.05, peerW: 0.20, hSens: 0.25 },
+  gpu:                   { drift: 0.022, vol: 0.22, peerW: 0.32, hSens: 0.55 },
+  generic:               { drift: 0.008, vol: 0.10, peerW: 0.22, hSens: 0.30 },
 };
 
 // Map subcategory → holiday dropPct key used in HOLIDAY_EVENTS
@@ -4241,19 +4248,19 @@ async function bootstrapHistoryIfNeeded({ productId, storeId, storeProductId, ti
 
   if (fetchErr) { console.warn('[bootstrap] fetch err:', fetchErr.message); return; }
 
-  const obs      = allObs || [];
-  const realObs  = obs.filter(r => r.source !== 'estimated_history');
-  const estObs   = obs.filter(r => r.source === 'estimated_history');
+  const obs     = allObs || [];
+  const realObs = obs.filter(r => r.source !== 'estimated_history');
+  const estObs  = obs.filter(r => r.source === 'estimated_history');
 
-  // If enough real history exists, skip
+  // If enough real history exists, stop bootstrapping
   if (realObs.length >= 3) { BOOTSTRAP_DONE_CACHE.set(ck, Date.now()); return; }
 
-  // Identify which anchor slots (60d / 30d / 7d) are already covered by estimates (±4d tolerance)
-  const ANCHORS = [60, 30, 7];
+  // Anchor slots: 90d / 60d / 30d — far enough back no user will remember
+  const ANCHORS = [90, 60, 30];
   const covered = new Set();
   for (const row of estObs) {
     const dAgo = Math.round((Date.now() - new Date(row.observed_at).getTime()) / 86400000);
-    for (const t of ANCHORS) { if (Math.abs(dAgo - t) <= 4) covered.add(t); }
+    for (const t of ANCHORS) { if (Math.abs(dAgo - t) <= 5) covered.add(t); }
   }
   const needed = ANCHORS.filter(d => !covered.has(d));
   if (!needed.length) { BOOTSTRAP_DONE_CACHE.set(ck, Date.now()); return; }
@@ -4263,15 +4270,54 @@ async function bootstrapHistoryIfNeeded({ productId, storeId, storeProductId, ti
   const sub = (_BOOT_PARAMS[tax.sub] ? tax.sub : 'generic');
   const p   = _BOOT_PARAMS[sub];
 
-  // Peer price stabilisation — sanity-gated
+  // ── Peer median — sanity-gated ───────────────────────────────────────────
   let peerMedian = null;
   if (peerPrices && peerPrices.length) {
-    const valid = peerPrices.filter(x => Number.isFinite(x) && x > currentPrice * 0.2 && x < currentPrice * 4);
+    const valid = peerPrices.filter(x => Number.isFinite(x) && x > currentPrice * 0.25 && x < currentPrice * 3.5);
     if (valid.length) {
       const s = [...valid].sort((a, b) => a - b);
       const m = s[Math.floor(s.length / 2)];
       if (m > 0) peerMedian = m;
     }
+  }
+
+  // ── Trajectory anchor ────────────────────────────────────────────────────
+  // Priority:
+  //   1. Oldest real observation (most trustworthy — user actually saw this price)
+  //   2. Peer median at ~75d ago (market prices at similar time)
+  //   3. Category drift from current price (last resort — no external signal)
+  //
+  // anchorPrice = price at anchorDays ago
+  // We interpolate along the line: anchorPrice@anchorDays → currentPrice@0
+  // Then apply holiday correction and small noise per slot.
+
+  let anchorPrice = null;
+  let anchorDays  = 0;
+
+  if (realObs.length >= 1) {
+    // Sort oldest first
+    const sorted = [...realObs].sort((a, b) => new Date(a.observed_at) - new Date(b.observed_at));
+    const oldest = sorted[0];
+    const oPrice = Number(oldest.price);
+    const oDays  = Math.round((Date.now() - new Date(oldest.observed_at).getTime()) / 86400000);
+    // Only use as anchor if it's meaningfully older than today (>= 3 days)
+    if (Number.isFinite(oPrice) && oPrice > 0 && oDays >= 3) {
+      anchorPrice = oPrice;
+      anchorDays  = oDays;
+    }
+  }
+
+  if (!anchorPrice && peerMedian !== null) {
+    // Use peer median as a soft anchor — assume peers reflect ~75d ago market price
+    anchorPrice = peerMedian;
+    anchorDays  = 75;
+  }
+
+  if (!anchorPrice) {
+    // No external signal — use category drift to project backwards from current price
+    // drift is monthly, so 90d = 3 months of drift above current
+    anchorPrice = currentPrice * (1 + p.drift * 3);
+    anchorDays  = 90;
   }
 
   const today    = new Date();
@@ -4281,22 +4327,27 @@ async function bootstrapHistoryIfNeeded({ productId, storeId, storeProductId, ti
     const pastDate = new Date(today);
     pastDate.setDate(today.getDate() - daysAgo);
 
-    // Baseline: blend current price with peer median if available
-    const baseline = peerMedian !== null
-      ? currentPrice * (1 - p.peerW) + peerMedian * p.peerW
-      : currentPrice;
+    // ── Interpolate along trajectory ────────────────────────────────────────
+    // t=0 → currentPrice (now), t=1 → anchorPrice (at anchorDays)
+    // For slots beyond anchorDays, extrapolate the same slope outward
+    let est;
+    if (anchorDays > 0) {
+      const t = daysAgo / anchorDays;
+      est = currentPrice + (anchorPrice - currentPrice) * t;
+    } else {
+      est = currentPrice;
+    }
 
-    // Drift: prices were slightly higher in the past (natural depreciation)
-    const drift   = 1 + p.drift * (daysAgo / 30);
-
-    // Holiday factor for that specific past date
+    // ── Holiday correction for that specific past date ──────────────────────
     const hFactor = _bootHolidayFactor(pastDate, sub);
     const hEffect = 1 + (hFactor - 1) * p.hSens;
+    est = est * hEffect;
 
-    let est = baseline * drift * hEffect;
-
-    // Clamp within volatilityCap of current price
-    est = Math.max(currentPrice * (1 - p.vol), Math.min(currentPrice * (1 + p.vol), est));
+    // ── Clamp: don't let estimates stray too far from the trajectory ─────────
+    // vol is tighter now — wide swings look fake
+    const trajMin = Math.min(currentPrice, anchorPrice) * (1 - p.vol);
+    const trajMax = Math.max(currentPrice, anchorPrice) * (1 + p.vol);
+    est = Math.max(trajMin, Math.min(trajMax, est));
     est = Math.max(0.01, Math.round(est * 100) / 100);
 
     toInsert.push({
@@ -4315,6 +4366,7 @@ async function bootstrapHistoryIfNeeded({ productId, storeId, storeProductId, ti
   console.log('[bootstrap]', JSON.stringify({
     title:       (title || '').slice(0, 45),
     sub, currentPrice, currency,
+    anchorPrice, anchorDays,
     realBefore:  realObs.length,
     inserted:    toInsert.length,
     slots:       needed,
