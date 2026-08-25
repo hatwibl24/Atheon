@@ -4396,6 +4396,59 @@ app.post("/v1/observations", async (req, res) => {
     console.log("[obs] price hidden for " + o.storeId + "/" + o.storeProductId + " — skipping");
     return res.json({ ok: true, skipped: true, reason: "price_hidden", priceStatus: o.priceStatus });
   }
+
+  // ── No-single-price states (multiple sellers, not shippable to buyer) ──
+  // There's genuinely no price to store or compare against — but we still
+  // know what PRODUCT this is from the title, so we can still surface
+  // "Other Models" (identity-matched listings elsewhere) even though
+  // price-dependent features (Better Deals ranking, fake-deal detection,
+  // prediction) can't run without a number.
+  if (o.priceStatus === "multiple_offers" || o.priceStatus === "not_shippable") {
+    console.log(`[obs] no single price (${o.priceStatus}) for ${o.storeId}/${o.storeProductId} — identity-only lookup`);
+    try {
+      const urlHost = (() => { try { return new URL(o.pageUrl).host.toLowerCase().replace(/^www\./,""); } catch { return null; } })();
+      // Upsert product WITHOUT touching last_price/currency — we don't want
+      // a null price to clobber a previously known real price for this item.
+      const { data: existingProduct } = await supabase.from("products")
+        .select("id,title").eq("store_id", o.storeId).eq("store_product_id", o.storeProductId).maybeSingle();
+      let productId = existingProduct?.id;
+      if (!productId) {
+        const { data: inserted } = await supabase.from("products").insert({
+          store_id: o.storeId, store_product_id: o.storeProductId,
+          canonical_url: o.canonicalUrl, title: o.title, image_url: o.imageUrl,
+          currency: o.currency, last_seen_at: new Date().toISOString()
+        }).select("id").single();
+        productId = inserted?.id;
+      } else {
+        await supabase.from("products").update({ last_seen_at: new Date().toISOString(), title: o.title })
+          .eq("id", productId);
+      }
+      await supabase.from("store_listings").upsert({ store_id: o.storeId, host: urlHost||o.host||"unknown",
+        store_product_id: o.storeProductId, canonical_url: o.canonicalUrl, page_url: o.pageUrl,
+        title: o.title, image_url: o.imageUrl, currency: o.currency }, { onConflict: "store_id,store_product_id" });
+      autoEmbedListing(o.storeId, o.storeProductId, o.title).catch(() => {});
+
+      const dealsResult = await computeDealsForProduct({
+        storeId: o.storeId, storeProductId: o.storeProductId,
+        baseTitle: o.title || existingProduct?.title || "", baseCurrency: o.currency,
+        basePrice: null, // no price to rank cheaper-than — otherModels still populates
+        limit: 10
+      });
+
+      return res.json({
+        ok: true, productId, priceStatus: o.priceStatus, price: null,
+        deals: [], // Better Deals needs a price baseline — intentionally empty
+        otherModels: (dealsResult?.otherModels || []).slice(0, 8),
+        note: o.priceStatus === "not_shippable"
+          ? "No offer ships to this location — showing matching models we know about elsewhere."
+          : "This listing has multiple sellers with no single price — showing matching models we know about elsewhere.",
+      });
+    } catch (e) {
+      console.warn("[obs] identity-only lookup failed:", e.message);
+      return res.json({ ok: true, skipped: true, reason: o.priceStatus, priceStatus: o.priceStatus, otherModels: [] });
+    }
+  }
+
   if (o.price == null || !Number.isFinite(o.price) || o.price <= 0) {
     return res.status(400).json({ error: "missing_price" });
   }
