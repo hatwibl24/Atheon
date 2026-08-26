@@ -2322,6 +2322,33 @@ function normalize(t) {
   return { s, tokens };
 }
 
+// ── Seller-noise stripping — general, not tuned to any product ─────────
+// Marketplace sellers (worst on eBay/AliExpress) pad titles with SEO/hype
+// boilerplate that has nothing to do with product identity. This dilutes
+// token-overlap-style scoring: two identical products with different
+// amounts of padding look less similar than they are. Strip common noise
+// patterns before anything does semantic comparison — applies uniformly
+// across every category and store, no product-specific tuning.
+const SELLER_NOISE_PATTERNS = [
+  /\b(brand\s*new|factory\s*sealed|sealed\s*box|new\s*sealed)\b/gi,
+  /\b(fast|free|same[\s-]?day|express)\s*shipping\b/gi,
+  /\b(fast|quick)\s*ship\b/gi,
+  /\b(100%\s*)?(authentic|genuine|original)\b/gi,
+  /\b(hot\s*sale|best\s*price|best\s*seller|top\s*rated|must\s*have)\b/gi,
+  /\b(us|uk|eu)\s*seller\b/gi,
+  /\bin\s*stock\b/gi,
+  /\bltd\s*offer\b/gi,
+  /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, // emoji ranges
+  /[★☆✅🔥⚡️💯]/g,
+  /\s{2,}/g,
+];
+
+function stripSellerNoise(title) {
+  let s = title || "";
+  for (const pat of SELLER_NOISE_PATTERNS) s = s.replace(pat, " ");
+  return s.replace(/\s+/g, " ").trim();
+}
+
 // ── TAXONOMY ─────────────────────────────────────────────────
 function taxonomy(title) {
   const { s } = normalize(title);
@@ -3833,6 +3860,24 @@ function buildRetrievalQueries(title, tax) {
 }
 
 // ── MAIN ENGINE ───────────────────────────────────────────────
+// ── Match rejection diagnostics ─────────────────────────────────────────
+// Previously these reasons were computed (dbg object) and thrown away after
+// each request — meaning nobody could ever see WHY a product wasn't
+// matching without guessing from one example. This keeps a rolling window
+// of rejections in memory (survives until next deploy — fine for pattern
+// spotting, not meant as permanent storage) so real usage data reveals
+// which categories/reasons dominate, generally, across every product.
+const MATCH_REJECTION_LOG = [];
+const MATCH_REJECTION_LOG_MAX = 2000;
+
+function logMatchRejection(entry) {
+  MATCH_REJECTION_LOG.push({ ...entry, t: Date.now() });
+  if (MATCH_REJECTION_LOG.length > MATCH_REJECTION_LOG_MAX) MATCH_REJECTION_LOG.shift();
+  // Structured console line — grep-able in Render logs as a backup even
+  // if the in-memory log gets cleared by a redeploy.
+  console.log("[match-reject]", JSON.stringify(entry));
+}
+
 async function computeDealsForProduct({ storeId, storeProductId, baseTitle, baseCurrency, basePrice, limit = 20 }) {
   const baseTax        = taxonomy(baseTitle);
   const plugin         = getPlugin(baseTax.sub);
@@ -3851,28 +3896,63 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
     vectorUsed: false,
   };
 
-  // ── Shared scorer — identical logic to old per-store loop ──
+  // ── Shared scorer — SOFT-SCORED, not hard-gated ──────────────────
+  // Previously: role/category/price/confidence were sequential hard gates —
+  // any ONE of them failing killed the candidate outright, even if the
+  // underlying semantic match (plugin.identityMatch/score) was excellent.
+  // That's brittle against inconsistent seller-written titles (worst on
+  // eBay/marketplaces) where a real match gets misclassified on ONE axis.
+  // Now: every signal contributes a penalty to one combined score, and only
+  // candidates below the acceptance floor get dropped. A strong semantic
+  // match can survive a shaky role/category/confidence read; a weak
+  // semantic match still gets filtered by the same signals as before.
+  const MIN_ACCEPT_SCORE = 0.35; // tuned conservatively — raise if false positives appear across categories, not for one product
+
   function scoreAndBucket(cand) {
     const candClassified = classifyListingRuntime(cand.title);
-    if (candClassified.role !== 'main_product') { dbg.rejectedRole++; dbg.hardRejected++; return; }
-
     const candTax = taxonomy(cand.title);
-    if (baseTax.cat !== 'unknown' && candTax.cat !== 'unknown' && baseTax.cat !== candTax.cat) {
-      dbg.rejectedIntentMismatch++; dbg.hardRejected++; return;
-    }
 
-    if (!priceSane(baseTax.sub, cand.price)) { dbg.rejectedPrice++; dbg.hardRejected++; return; }
-
+    // Compute the real semantic signal FIRST, unconditionally — this is
+    // the strongest evidence of "same product" we have, so nothing should
+    // discard a candidate before we've even looked at it.
     let identMatch = 'uncertain', score = 0, label = 'Similar', mTier = 'RELATED';
     try {
-      identMatch = plugin.identityMatch(baseTitle, cand.title);
-      score      = plugin.score(baseTitle, cand.title);
+      const cleanBase = stripSellerNoise(baseTitle);
+      const cleanCand = stripSellerNoise(cand.title);
+      identMatch = plugin.identityMatch(cleanBase, cleanCand);
+      score      = plugin.score(cleanBase, cleanCand);
       label      = plugin.label(identMatch);
       mTier      = plugin.matchTier(identMatch);
     } catch {}
 
+    // Each signal is now a penalty, not an instant kill.
+    let penalty = 0;
+    const reasons = [];
+
+    if (candClassified.role !== 'main_product') {
+      penalty += 0.35; reasons.push('role_mismatch'); dbg.rejectedRole++;
+    }
+    if (baseTax.cat !== 'unknown' && candTax.cat !== 'unknown' && baseTax.cat !== candTax.cat) {
+      // Cross-category is strong evidence of a true negative — heavier
+      // penalty, but still not an automatic kill if semantic score is
+      // overwhelming (e.g. taxonomy misfiled a bundle listing).
+      penalty += 0.55; reasons.push('category_mismatch'); dbg.rejectedIntentMismatch++;
+    }
+    if (!priceSane(baseTax.sub, cand.price)) {
+      penalty += 0.30; reasons.push('price_out_of_range'); dbg.rejectedPrice++;
+    }
     if (candClassified.numericConfidence !== undefined && candClassified.numericConfidence < 25) {
-      dbg.rejectedClassifierLowConfidence++; dbg.hardRejected++; return;
+      penalty += 0.20; reasons.push('low_classifier_confidence'); dbg.rejectedClassifierLowConfidence++;
+    }
+
+    const finalScore = score - penalty;
+
+    if (finalScore < MIN_ACCEPT_SCORE) {
+      dbg.hardRejected++;
+      dbg.rejectedWeakIdentity++;
+      logMatchRejection({ baseTitle, candTitle: cand.title, storeId: cand.storeId,
+        score, penalty, finalScore, reasons, candTax: candTax.cat, baseTax: baseTax.cat });
+      return;
     }
 
     const { bucket } = decideDealBucket(
@@ -6708,6 +6788,40 @@ app.get('/v1/admin/trust-report', async (req, res) => {
   try {
     const report = await generateTrustReport();
     res.json({ ok: true, report });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /v1/admin/match-diagnostics — aggregate view of WHY candidates got
+// rejected during matching, across every product/category, from the
+// rolling in-memory log. This is the general replacement for "give me one
+// example" — it shows the real distribution of failure reasons so fixes
+// can target what's actually common instead of one anecdote.
+app.get('/v1/admin/match-diagnostics', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const byReason = {};
+    const byCategory = {};
+    const nearMisses = []; // rejected candidates that were CLOSE to the threshold — most actionable
+    for (const entry of MATCH_REJECTION_LOG) {
+      for (const r of (entry.reasons || [])) byReason[r] = (byReason[r] || 0) + 1;
+      const cat = entry.baseTax || 'unknown';
+      byCategory[cat] = (byCategory[cat] || 0) + 1;
+      if (entry.finalScore > 0.15) nearMisses.push(entry); // within ~0.2 of the accept floor
+    }
+    nearMisses.sort((a, b) => b.finalScore - a.finalScore);
+    res.json({
+      ok: true,
+      totalRejections: MATCH_REJECTION_LOG.length,
+      byReason,       // e.g. {"role_mismatch": 340, "category_mismatch": 120, ...}
+      byCategory,     // which product categories generate the most rejections
+      nearMisses: nearMisses.slice(0, 30), // most actionable — these ALMOST passed
+      note: "In-memory rolling log (last " + MATCH_REJECTION_LOG_MAX + " rejections) — resets on redeploy. Review byReason first to see which signal is causing the most losses, then nearMisses for concrete examples worth investigating.",
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
