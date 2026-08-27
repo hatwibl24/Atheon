@@ -4944,6 +4944,28 @@ app.get("/v1/compare/:storeId/:storeProductId", async (req, res) => {
       limit: limit + offset + 20,
     });
 
+    // No price to rank against — same situation as the no-price path in
+    // /v1/observations. Apply the SAME broadening here, or this route
+    // (which the extension also calls, moments after /v1/observations,
+    // to silently refresh deals) will overwrite the already-broadened
+    // results with a thinner strict-only set. Keeping both routes
+    // consistent, not just one.
+    if (!Number.isFinite(basePrice) && result.otherModels.length < 4) {
+      try {
+        const baseTax = taxonomy(baseTitle);
+        const excludeKeys = new Set([
+          `${storeId}|${storeProductId}`,
+          ...result.otherModels.map(m => `${m.storeId}|${m.storeProductId}`),
+        ]);
+        const broadened = await fetchFamilyAndCategoryFallback({
+          baseTitle, baseTax, excludeKeys, limit: 8 - result.otherModels.length,
+        });
+        result.otherModels = [...result.otherModels, ...broadened];
+      } catch (e) {
+        console.warn("[compare] family/category broadening failed:", e.message);
+      }
+    }
+
     const otherOffset = Math.max(0, Number(req.query.otherOffset||0));
     const otherLimit  = Math.max(1, Math.min(100, Number(req.query.otherLimit||12)));
 
