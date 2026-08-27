@@ -3878,6 +3878,78 @@ function logMatchRejection(entry) {
   console.log("[match-reject]", JSON.stringify(entry));
 }
 
+// ── Family/category broadening — for when strict identity matching comes
+// back too thin (notably: no-price listings, where there's no price signal
+// to help narrow things down). Reuses the SAME tiered queries
+// buildRetrievalQueries() already defines (precise → family → broad
+// category) — general infrastructure, not rebuilt per-category here.
+// Tier A: "other iPhones" (same family, any generation/variant)
+// Tier B: "other phones" (same category, any brand)
+// Each candidate is tagged with which tier found it so the UI can label
+// them honestly ("Other iPhone models" vs "You might also like") instead
+// of presenting a loose category browse as if it were a tight match.
+async function fetchFamilyAndCategoryFallback({ baseTitle, baseTax, excludeKeys, limit = 8 }) {
+  const queries = buildRetrievalQueries(baseTitle, baseTax);
+  if (!queries.length) return [];
+
+  // Family tier = second-to-last query (if present); broad category tier
+  // = always the last query. For subs with only one query defined, both
+  // point at the same tier — still better than nothing.
+  const familyQuery = queries.length >= 2 ? queries[queries.length - 2] : queries[queries.length - 1];
+  const broadQuery  = queries[queries.length - 1];
+
+  const { data: stores } = await supabase.from('stores').select('id');
+  const storeIds = (stores || []).map(s => s.id);
+  const seen = new Set(excludeKeys || []);
+  const results = [];
+
+  async function runTier(query, tierLabel, matchTier, wanted) {
+    if (results.length >= wanted) return;
+    for (const sid of storeIds) {
+      if (results.length >= wanted) break;
+      let q = supabase.from('store_listings')
+        .select('store_id,store_product_id,title,page_url,canonical_url')
+        .eq('store_id', sid).limit(30);
+      if (query.mode === 'OR' && query.terms.length > 1) {
+        const safe = t => t.replace(/[%_,]/g, ' ').trim().replace(/\s+/g, ' ');
+        const orClause = query.terms.filter(t => t.trim().length > 0)
+          .map(t => `title.ilike.%${safe(t)}%`).join(',');
+        if (!orClause) continue;
+        q = q.or(orClause);
+      } else {
+        for (const term of query.terms) q = q.ilike('title', `%${term}%`);
+      }
+      const { data: listings } = await q;
+      if (!listings?.length) continue;
+      const { data: prods } = await supabase.from('products')
+        .select('store_id,store_product_id,last_price,currency')
+        .eq('store_id', sid).in('store_product_id', listings.map(x => x.store_product_id));
+      const pm = new Map((prods || []).map(p => [`${p.store_id}|${p.store_product_id}`, p]));
+      for (const li of listings) {
+        const key = `${sid}|${li.store_product_id}`;
+        if (seen.has(key)) continue;
+        const p = pm.get(key); if (!p) continue;
+        const price = Number(p.last_price);
+        if (!Number.isFinite(price) || price <= 0) continue;
+        seen.add(key);
+        results.push({
+          storeId: sid, storeProductId: String(li.store_product_id),
+          title: li.title || '', price, currency: p.currency || 'USD',
+          url: li.page_url || li.canonical_url || null,
+          matchTier, matchLabel: tierLabel,
+        });
+        if (results.length >= wanted) break;
+      }
+    }
+  }
+
+  await runTier(familyQuery, `Other ${baseTax.sub === 'phone' ? '' : ''}models in this line`.trim(), 'SAME_FAMILY', limit);
+  if (results.length < limit) {
+    await runTier(broadQuery, 'You might also like', 'SAME_CATEGORY', limit);
+  }
+  return results.slice(0, limit);
+}
+
 async function computeDealsForProduct({ storeId, storeProductId, baseTitle, baseCurrency, basePrice, limit = 20 }) {
   const baseTax        = taxonomy(baseTitle);
   const plugin         = getPlugin(baseTax.sub);
@@ -4515,10 +4587,34 @@ app.post("/v1/observations", async (req, res) => {
         limit: 10
       });
 
+      let otherModels = (dealsResult?.otherModels || []).slice(0, 8);
+
+      // Strict identity matching came back thin — no price signal to help
+      // narrow candidates, so broaden: same family first ("other iPhones"),
+      // then same category ("other phones") if still short. Never leave
+      // the user with nothing just because we can't find THIS exact price.
+      const MIN_OTHER_MODELS = 4;
+      if (otherModels.length < MIN_OTHER_MODELS) {
+        try {
+          const baseTax = taxonomy(o.title || existingProduct?.title || "");
+          const excludeKeys = new Set([
+            `${o.storeId}|${o.storeProductId}`,
+            ...otherModels.map(m => `${m.storeId}|${m.storeProductId}`),
+          ]);
+          const broadened = await fetchFamilyAndCategoryFallback({
+            baseTitle: o.title || existingProduct?.title || "",
+            baseTax, excludeKeys, limit: 8 - otherModels.length,
+          });
+          otherModels = [...otherModels, ...broadened];
+        } catch (e) {
+          console.warn("[obs] family/category broadening failed:", e.message);
+        }
+      }
+
       return res.json({
         ok: true, productId, priceStatus: o.priceStatus, price: null,
         deals: [], // Better Deals needs a price baseline — intentionally empty
-        otherModels: (dealsResult?.otherModels || []).slice(0, 8),
+        otherModels,
         note: o.priceStatus === "not_shippable"
           ? "No offer ships to this location — showing matching models we know about elsewhere."
           : "This listing has multiple sellers with no single price — showing matching models we know about elsewhere.",
