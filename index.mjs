@@ -4944,13 +4944,23 @@ app.get("/v1/compare/:storeId/:storeProductId", async (req, res) => {
       limit: limit + offset + 20,
     });
 
+    const otherOffset = Math.max(0, Number(req.query.otherOffset||0));
+    const otherLimit  = Math.max(1, Math.min(100, Number(req.query.otherLimit||12)));
+
     // No price to rank against — same situation as the no-price path in
     // /v1/observations. Apply the SAME broadening here, or this route
     // (which the extension also calls, moments after /v1/observations,
     // to silently refresh deals) will overwrite the already-broadened
     // results with a thinner strict-only set. Keeping both routes
     // consistent, not just one.
-    if (!Number.isFinite(basePrice) && result.otherModels.length < 4) {
+    //
+    // IMPORTANT: the broadening fetch must cover the requested page
+    // (otherOffset + otherLimit), not a flat floor. A flat "top up to 8"
+    // cap meant result.otherModels.length could never exceed ~8, so
+    // otherHasMore permanently read false once 8 were loaded — Load More
+    // looked broken even though more family/category matches existed.
+    const neededForPage = otherOffset + otherLimit;
+    if (!Number.isFinite(basePrice) && result.otherModels.length < Math.max(4, neededForPage)) {
       try {
         const baseTax = taxonomy(baseTitle);
         const excludeKeys = new Set([
@@ -4958,16 +4968,14 @@ app.get("/v1/compare/:storeId/:storeProductId", async (req, res) => {
           ...result.otherModels.map(m => `${m.storeId}|${m.storeProductId}`),
         ]);
         const broadened = await fetchFamilyAndCategoryFallback({
-          baseTitle, baseTax, excludeKeys, limit: 8 - result.otherModels.length,
+          baseTitle, baseTax, excludeKeys,
+          limit: Math.max(8, neededForPage) - result.otherModels.length,
         });
         result.otherModels = [...result.otherModels, ...broadened];
       } catch (e) {
         console.warn("[compare] family/category broadening failed:", e.message);
       }
     }
-
-    const otherOffset = Math.max(0, Number(req.query.otherOffset||0));
-    const otherLimit  = Math.max(1, Math.min(100, Number(req.query.otherLimit||12)));
 
     const bestPage  = result.bestDeals.slice(offset, offset + limit);
     const otherPage = result.otherModels.slice(otherOffset, otherOffset + otherLimit);
