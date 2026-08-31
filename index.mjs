@@ -4249,15 +4249,39 @@ const ObservationSchema = z.object({
   pageUrl: z.string().url().optional(), page_url: z.string().url().optional(),
   imageUrl: z.string().optional().nullable(), image_url: z.string().optional().nullable(),
   title: z.string().optional().nullable(), price: z.number().positive().optional().nullable(),
+  // titleNormalized: computed client-side (normalizeProductTitle) to strip
+  // spec-stuffing noise ("4GB RAM 64GB 5000mAh...") down to brand+model, so
+  // matching against other stores' listings for the same product actually
+  // works. Previously computed and sent by content.js but never declared
+  // here, so Zod silently dropped it before it ever reached the matcher.
+  titleNormalized: z.string().optional().nullable(), title_normalized: z.string().optional().nullable(),
   currency: z.string().min(3).max(3).default("USD"),
   source: z.string().optional().default("extension"), host: z.string().optional().nullable(),
   wasPrice: z.number().positive().optional().nullable(),
-  priceSource: z.enum(["jsonld","corePrice","buybox","generic","none","unknown"]).optional().default("unknown"),
-  priceStatus: z.enum(["ok","hidden","unavailable","unknown"]).optional().default("unknown")
+  // Expanded to match every value content.js actually sends. The previous
+  // short list silently 400'd anything from the generic JSON-LD/OG-meta
+  // fallback tier ("generic-structured", "generic-meta", "generic-meta-text"),
+  // the Amazon direct/AOD selectors ("direct", "aod"), and the new Lazada
+  // extractor ("lazada-provisional") — i.e. most non-"jsonld" successful
+  // extractions were being rejected at the schema layer before they ever
+  // reached the unknown_store check.
+  priceSource: z.enum([
+    "jsonld","corePrice","buybox","direct","aod",
+    "generic","generic-structured","generic-meta","generic-meta-text",
+    "lazada-provisional","none","unknown"
+  ]).optional().default("unknown"),
+  // Expanded similarly: "blocked" (bot-challenge/CAPTCHA pages, including
+  // our new generic blocked-page detector), "multiple_offers" and
+  // "not_shippable" (Amazon's distinct no-single-price states) were all
+  // being rejected before reaching storage.
+  priceStatus: z.enum([
+    "ok","hidden","unavailable","blocked","multiple_offers","not_shippable","unknown"
+  ]).optional().default("unknown")
 }).transform(o => ({
   storeId: o.storeId ?? o.store_id, storeProductId: o.storeProductId ?? o.store_product_id,
   canonicalUrl: o.canonicalUrl ?? o.canonical_url, pageUrl: o.pageUrl ?? o.page_url,
-  title: o.title ?? null, imageUrl: o.imageUrl ?? o.image_url ?? null,
+  title: o.title ?? null, titleNormalized: o.titleNormalized ?? o.title_normalized ?? null,
+  imageUrl: o.imageUrl ?? o.image_url ?? null,
   price: o.price ?? null, currency: o.currency ?? "USD", source: o.source ?? "extension",
   host: o.host ?? null, wasPrice: o.wasPrice ?? null,
   priceSource: o.priceSource ?? "unknown", priceStatus: o.priceStatus ?? "unknown"
@@ -4562,27 +4586,28 @@ app.post("/v1/observations", async (req, res) => {
       // Upsert product WITHOUT touching last_price/currency — we don't want
       // a null price to clobber a previously known real price for this item.
       const { data: existingProduct } = await supabase.from("products")
-        .select("id,title").eq("store_id", o.storeId).eq("store_product_id", o.storeProductId).maybeSingle();
+        .select("id,title,title_key").eq("store_id", o.storeId).eq("store_product_id", o.storeProductId).maybeSingle();
       let productId = existingProduct?.id;
       if (!productId) {
         const { data: inserted } = await supabase.from("products").insert({
           store_id: o.storeId, store_product_id: o.storeProductId,
           canonical_url: o.canonicalUrl, title: o.title, image_url: o.imageUrl,
+          title_key: o.titleNormalized || o.title,
           currency: o.currency, last_seen_at: new Date().toISOString()
         }).select("id").single();
         productId = inserted?.id;
       } else {
-        await supabase.from("products").update({ last_seen_at: new Date().toISOString(), title: o.title })
+        await supabase.from("products").update({ last_seen_at: new Date().toISOString(), title: o.title, title_key: o.titleNormalized || o.title })
           .eq("id", productId);
       }
       await supabase.from("store_listings").upsert({ store_id: o.storeId, host: urlHost||o.host||"unknown",
         store_product_id: o.storeProductId, canonical_url: o.canonicalUrl, page_url: o.pageUrl,
-        title: o.title, image_url: o.imageUrl, currency: o.currency }, { onConflict: "store_id,store_product_id" });
+        title: o.title, title_key: o.titleNormalized || o.title, image_url: o.imageUrl, currency: o.currency }, { onConflict: "store_id,store_product_id" });
       autoEmbedListing(o.storeId, o.storeProductId, o.title).catch(() => {});
 
       const dealsResult = await computeDealsForProduct({
         storeId: o.storeId, storeProductId: o.storeProductId,
-        baseTitle: o.title || existingProduct?.title || "", baseCurrency: o.currency,
+        baseTitle: o.titleNormalized || o.title || existingProduct?.title_key || existingProduct?.title || "", baseCurrency: o.currency,
         basePrice: null, // no price to rank cheaper-than — otherModels still populates
         limit: 10
       });
@@ -4639,13 +4664,17 @@ app.post("/v1/observations", async (req, res) => {
   const { data: product, error: upsertErr } = await supabase.from("products").upsert({
     store_id: o.storeId, store_product_id: o.storeProductId,
     canonical_url: o.canonicalUrl, title: o.title, image_url: o.imageUrl,
+    // title_key: previously unused column, repurposed here to store the
+    // client-computed normalized title (brand+model, spec-noise stripped).
+    // Falls back to raw title so the column is never left null.
+    title_key: o.titleNormalized || o.title,
     currency: o.currency, last_price: o.price, last_seen_at: new Date().toISOString()
-  }, { onConflict: "store_id,store_product_id" }).select("id,store_id,store_product_id,last_price,currency,title").single();
+  }, { onConflict: "store_id,store_product_id" }).select("id,store_id,store_product_id,last_price,currency,title,title_key").single();
   if (upsertErr) return res.status(500).json({ error: "db_upsert_failed", detail: upsertErr.message });
 
   try {
     const urlHost = (() => { try { return new URL(o.pageUrl).host.toLowerCase().replace(/^www\./,""); } catch { return null; } })();
-    await supabase.from("store_listings").upsert({ store_id: o.storeId, host: urlHost||o.host||"unknown", store_product_id: o.storeProductId, canonical_url: o.canonicalUrl, page_url: o.pageUrl, title: o.title, image_url: o.imageUrl, currency: o.currency }, { onConflict: "store_id,store_product_id" });
+    await supabase.from("store_listings").upsert({ store_id: o.storeId, host: urlHost||o.host||"unknown", store_product_id: o.storeProductId, canonical_url: o.canonicalUrl, page_url: o.pageUrl, title: o.title, title_key: o.titleNormalized || o.title, image_url: o.imageUrl, currency: o.currency }, { onConflict: "store_id,store_product_id" });
     // Auto-embed new listings — fires async, never blocks the response
     autoEmbedListing(o.storeId, o.storeProductId, o.title).catch(() => {});
   } catch {}
@@ -4687,7 +4716,7 @@ app.post("/v1/observations", async (req, res) => {
   }
 
   if (!dealsResult) {
-    dealsResult = await computeDealsForProduct({ storeId: o.storeId, storeProductId: o.storeProductId, baseTitle: o.title||product.title||"", baseCurrency: o.currency, basePrice: o.price, limit: 10 });
+    dealsResult = await computeDealsForProduct({ storeId: o.storeId, storeProductId: o.storeProductId, baseTitle: o.titleNormalized || o.title || product.title_key || product.title || "", baseCurrency: o.currency, basePrice: o.price, limit: 10 });
     // Save to cache async — 2 hour TTL
     const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
     supabase.from("deals_cache").upsert(
