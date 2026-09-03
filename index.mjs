@@ -17,6 +17,101 @@ const supabase = createClient(
 );
 
 // ============================================================
+//  FX RATES — daily USD-pivot snapshot, cached in-memory
+//  Source: open.er-api.com (free, no key, 161+ currencies incl. all
+//  the African currencies Frankfurter/ECB-based APIs don't cover —
+//  confirmed UGX/NGN/KES/GHS/EGP/TND/DZD/MAD/XOF all present).
+//  Table: fx_rates_daily (rate_date, currency_code, rate_to_usd),
+//  rate_to_usd = units of currency_code per 1 USD.
+//  Attribution required per open.er-api.com terms — see FX_ATTRIBUTION.
+// ============================================================
+
+const FX_ATTRIBUTION = "Exchange rates by ExchangeRate-API (open.er-api.com)";
+
+async function refreshFxRates() {
+  try {
+    const res = await fetch("https://open.er-api.com/v6/latest/USD");
+    if (!res.ok) throw new Error(`fx fetch failed: ${res.status}`);
+    const data = await res.json();
+    if (data.result !== "success" || !data.rates) throw new Error("fx response malformed");
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = Object.entries(data.rates).map(([code, rate]) => ({
+      rate_date: today, currency_code: code, rate_to_usd: rate,
+    }));
+    const { error } = await supabase
+      .from("fx_rates_daily")
+      .upsert(rows, { onConflict: "rate_date,currency_code" });
+    if (error) console.error("[fx] upsert failed:", error.message);
+    else { console.log(`[fx] refreshed ${rows.length} currencies for ${today}`); _fxCache = { date: null, rates: null }; }
+  } catch (e) {
+    console.error("[fx] refreshFxRates failed:", e.message);
+  }
+}
+// Run once on boot, then every 24h. If a boot-time fetch fails (network
+// hiccup, provider down), the DB keeps yesterday's rates and getFxRates()
+// below falls back to the most recent date on file — never hard-fails.
+refreshFxRates();
+setInterval(refreshFxRates, 24 * 60 * 60 * 1000);
+
+// In-memory cache keyed by date so repeated calls in one day don't hit
+// the DB each time. Cleared whenever refreshFxRates() writes new rows.
+let _fxCache = { date: null, rates: null };
+
+async function getFxRates(dateStr) {
+  const d = dateStr || new Date().toISOString().slice(0, 10);
+  if (!dateStr && _fxCache.date === d && _fxCache.rates) return _fxCache.rates;
+  // <= d, newest first: if today's row hasn't landed yet (e.g. right after
+  // boot, before the first refresh completes) this falls back to the most
+  // recent prior date instead of returning nothing.
+  const { data, error } = await supabase
+    .from("fx_rates_daily")
+    .select("currency_code, rate_to_usd, rate_date")
+    .lte("rate_date", d)
+    .order("rate_date", { ascending: false })
+    .limit(400);
+  if (error || !data?.length) return (!dateStr && _fxCache.rates) || {};
+  const newestDate = data[0].rate_date;
+  const rates = {};
+  for (const r of data) {
+    if (r.rate_date !== newestDate) continue; // only take the single most recent date's snapshot
+    rates[r.currency_code] = Number(r.rate_to_usd);
+  }
+  if (!dateStr) _fxCache = { date: d, rates };
+  return rates;
+}
+
+// Converts `amount` from `fromCode` to `toCode`, pivoting through USD.
+// `dateStr` (YYYY-MM-DD) lets callers convert historical price_observations
+// using that day's rate instead of today's — avoids a pure FX swing showing
+// up as a fake price jump/drop in trend charts. Returns null (not a guess)
+// if either currency code isn't in the rates table, so callers can decide
+// their own fallback instead of silently comparing wrong numbers.
+async function convertCurrency(amount, fromCode, toCode, dateStr) {
+  if (amount == null || !fromCode || !toCode) return amount;
+  const from = String(fromCode).toUpperCase(), to = String(toCode).toUpperCase();
+  if (from === to) return amount;
+  const rates = await getFxRates(dateStr);
+  const fromRate = from === "USD" ? 1 : rates[from];
+  const toRate   = to   === "USD" ? 1 : rates[to];
+  if (!fromRate || !toRate) return null;
+  return (amount / fromRate) * toRate;
+}
+
+// Synchronous counterpart for hot loops (e.g. scoring dozens of candidates
+// per product) that already have a resolved rates object in hand from one
+// upfront `await getFxRates()` — avoids awaiting per-candidate. Same pivot
+// logic, same null-on-unknown-currency contract as convertCurrency above.
+function convertSync(amount, fromCode, toCode, rates) {
+  if (amount == null || !fromCode || !toCode) return amount;
+  const from = String(fromCode).toUpperCase(), to = String(toCode).toUpperCase();
+  if (from === to) return amount;
+  const fromRate = from === "USD" ? 1 : rates?.[from];
+  const toRate   = to   === "USD" ? 1 : rates?.[to];
+  if (!fromRate || !toRate) return null;
+  return (amount / fromRate) * toRate;
+}
+
+// ============================================================
 //  GEMINI — Three isolated services, three separate keys
 //  Each has its own quota bucket, cooldown, and model cache.
 // ============================================================
@@ -3422,17 +3517,30 @@ const BEST_DEAL_SUBCATEGORY_REJECTS = {
 };
 
 // ── FINAL BUCKETING ───────────────────────────────────────────
-function decideDealBucket(baseCtx, candCtx) {
-  const { baseTitle, basePrice, baseTax, baseClassified } = baseCtx;
+function decideDealBucket(baseCtx, candCtx, fxRates) {
+  const { baseTitle, basePrice, baseCurrency, baseTax, baseClassified } = baseCtx;
   const { cand, identMatch, score, candTax, candClassified } = candCtx;
 
   // Hard gate: candidate must be a main product
   if (candClassified.role !== 'main_product') return { bucket: 'DROP', reason: `role:${candClassified.role}` };
 
   // Hard gate: price sanity — per spec: 0.2x–3.5x base price, gentle and configurable
+  //
+  // FIX (currency): this used to compare cand.price against basePrice
+  // directly, with zero currency awareness. Two listings of the same
+  // phone in USD and UGX differ by ~3700x in raw number alone — that
+  // silently DROPped almost every cross-currency candidate before it
+  // ever reached the user, which is why results looked "segregated" by
+  // currency (UGX effectively always empty, USD-vs-USD stores like
+  // Walmart always survived because there was no real mismatch to hide).
+  // Now: convert cand.price into the base listing's currency first. If
+  // either currency is missing from the rates table, fall back to the
+  // old raw comparison rather than hard-dropping on a rates-table gap.
   if (basePrice && Number.isFinite(basePrice) && basePrice > 0) {
-    if (cand.price < basePrice * 0.20) return { bucket: 'DROP', reason: 'price_too_low' };
-    if (cand.price > basePrice * 3.5)  return { bucket: 'DROP', reason: 'price_too_high' };
+    const candPriceConverted = convertSync(cand.price, cand.currency, baseCurrency, fxRates);
+    const candPriceForCompare = candPriceConverted != null ? candPriceConverted : cand.price;
+    if (candPriceForCompare < basePrice * 0.20) return { bucket: 'DROP', reason: 'price_too_low' };
+    if (candPriceForCompare > basePrice * 3.5)  return { bucket: 'DROP', reason: 'price_too_high' };
   }
 
   // ── Noun / device-type mismatch shield ────────────────────────
@@ -3954,6 +4062,9 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
   const baseTax        = taxonomy(baseTitle);
   const plugin         = getPlugin(baseTax.sub);
   const baseClassified = classifyListingRuntime(baseTitle);
+  // Resolved once per call, not per-candidate — decideDealBucket() needs
+  // this to convert cand.price into baseCurrency before its sanity gate.
+  const fxRates         = await getFxRates();
 
   const acceptedSeen = new Set();
   const rawBest      = [];
@@ -4028,8 +4139,9 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
     }
 
     const { bucket } = decideDealBucket(
-      { baseTitle, basePrice, baseTax, baseClassified },
-      { cand, identMatch, score, candTax, candClassified }
+      { baseTitle, basePrice, baseCurrency, baseTax, baseClassified },
+      { cand, identMatch, score, candTax, candClassified },
+      fxRates
     );
     if (bucket === 'DROP') return;
 
