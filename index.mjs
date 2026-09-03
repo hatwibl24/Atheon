@@ -4149,8 +4149,24 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
     if (acceptedSeen.has(acceptKey)) return;
     acceptedSeen.add(acceptKey);
 
+    // FIX (currency, display layer): decideDealBucket()'s conversion above
+    // is used only for the internal 0.2x-3.5x comparison and discarded —
+    // `cand` itself still carries its native price/currency, so the item
+    // sent to the extension was showing the right currency SYMBOL (from
+    // cand.currency) next to the WRONG number (still cand's native
+    // amount, never converted). Convert here for real, into the base
+    // listing's currency — i.e. whatever currency the page the user is
+    // actually browsing uses, matching how the extension's own badge/
+    // comparison UI should read regardless of which store the deal came
+    // from. Native values kept alongside in case anything downstream
+    // needs the store's actual as-listed price/currency.
+    const displayPrice = convertSync(cand.price, cand.currency, baseCurrency, fxRates);
     const item = {
       ...cand,
+      price:          displayPrice != null ? displayPrice : cand.price,
+      currency:       displayPrice != null ? baseCurrency  : cand.currency,
+      nativePrice:    cand.price,
+      nativeCurrency: cand.currency,
       name:       STORE_DISPLAY[cand.storeId] || cand.storeId,
       matchTier:  mTier,
       matchLabel: label,
