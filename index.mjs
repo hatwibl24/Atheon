@@ -2608,6 +2608,7 @@ function detectRole(title) {
 }
 
 // ── PRICE SANITY ─────────────────────────────────────────────
+// Floors below are USD-denominated (a $80 floor for phones, etc).
 const _PRICE_FLOOR = {
   phone:80, tws_earbuds:5, headphones:10, gaming_headset:10,
   gaming_laptop:200, ultrabook:150, business_laptop:100, laptop:80,
@@ -2616,9 +2617,21 @@ const _PRICE_FLOOR = {
   power_bank:3, internal_ssd:10, external_storage:15,
   gaming_controller:15, software_subscription:2, gift_card:1,
 };
-function priceSane(sub, price) {
+// FIX (currency): this used to compare the candidate's raw native-currency
+// price directly against a USD-denominated floor — harmless for currencies
+// numerically bigger than USD (UGX/NGN native amounts always clear a $80
+// floor trivially) but theoretically too lenient for currencies numerically
+// smaller than USD (KWD/BHD, where a genuinely cheap/garbage listing's raw
+// number could still clear the floor unconverted). Now converts to USD
+// first, same as the decideDealBucket fix. `currency`/`fxRates` are
+// optional so any other caller passing just (sub, price) still works —
+// degrades to the old raw comparison rather than throwing.
+function priceSane(sub, price, currency, fxRates) {
   const floor = _PRICE_FLOOR[sub];
-  return !floor || price >= floor;
+  if (!floor) return true;
+  if (!currency || !fxRates) return price >= floor; // no currency info — old behavior
+  const usdPrice = convertSync(price, currency, "USD", fxRates);
+  return (usdPrice != null ? usdPrice : price) >= floor;
 }
 
 // ── PLUGINS ───────────────────────────────────────────────────
@@ -4121,7 +4134,7 @@ async function computeDealsForProduct({ storeId, storeProductId, baseTitle, base
       // overwhelming (e.g. taxonomy misfiled a bundle listing).
       penalty += 0.55; reasons.push('category_mismatch'); dbg.rejectedIntentMismatch++;
     }
-    if (!priceSane(baseTax.sub, cand.price)) {
+    if (!priceSane(baseTax.sub, cand.price, cand.currency, fxRates)) {
       penalty += 0.30; reasons.push('price_out_of_range'); dbg.rejectedPrice++;
     }
     if (candClassified.numericConfidence !== undefined && candClassified.numericConfidence < 25) {
