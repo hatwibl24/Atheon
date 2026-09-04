@@ -645,7 +645,23 @@ async function searchMarketPriceSerp(title, currency) {
   const hit = serpQueryCache.get(ck);
   if (hit) { console.log(`[serp] cache-hit for "${normQ.slice(0,40)}"`); return hit; }
 
-  const gl  = currency === 'GBP' ? 'gb' : currency === 'EUR' ? 'de' : 'us';
+  // SerpAPI's google_shopping engine only supports a small, fixed list of
+  // `gl` markets — confirmed against their docs, and critically it does
+  // NOT include Uganda, Kenya, Nigeria, Ghana, Egypt, Tunisia, Algeria, or
+  // Morocco (only South Africa, `za`, among African markets). So for most
+  // of the currencies this tool actually deals with, there's no matching
+  // country market to select at all — trying to map every currency to
+  // "its own" gl code isn't achievable through this API.
+  //
+  // Fix instead: `gl` picks the best available market for PRODUCT
+  // COVERAGE (a big, well-indexed market beats a nonexistent one), and
+  // we track exactly what currency THAT market's results come back in via
+  // GL_CURRENCY below. The caller (analyseDeal) converts serp prices to
+  // the base listing's currency using that tag, instead of silently
+  // mixing USD-priced comps into non-USD stats.
+  const GL_CURRENCY = { us: 'USD', gb: 'GBP', de: 'EUR', za: 'ZAR' };
+  const gl = currency === 'GBP' ? 'gb' : currency === 'EUR' ? 'de' : currency === 'ZAR' ? 'za' : 'us';
+  const serpCurrency = GL_CURRENCY[gl];
   const refs = [];
 
   // ── Query 1: tight (full normalised title, up to 90 chars) ──
@@ -669,6 +685,7 @@ async function searchMarketPriceSerp(title, currency) {
         if (!serpIdentityFilter(title, item.title || '', item)) continue;
         refs.push({
           price,
+          currency:  serpCurrency,
           source:    item.source || 'unknown',
           title:     (item.title || '').slice(0, 80),
           url:       item.product_link || item.link || '',   // product_link preferred
@@ -703,7 +720,7 @@ async function searchMarketPriceSerp(title, currency) {
             if (!serpIdentityFilter(title, item.title || '', item)) continue;
             const url = item.product_link || item.link || '';
             if (existURLs.has(url)) continue;
-            refs.push({ price, source: item.source || 'unknown', title: (item.title || '').slice(0, 80), url, condition: item.second_hand_condition ? 'used' : 'new' });
+            refs.push({ price, currency: serpCurrency, source: item.source || 'unknown', title: (item.title || '').slice(0, 80), url, condition: item.second_hand_condition ? 'used' : 'new' });
             if (refs.length >= 8) break;
           }
         }
@@ -751,6 +768,9 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
   const curr = currency || 'USD';
   const fmt  = p => moneyFmt(curr, p);
   const VALID_FROM = new Date('2025-02-25T00:00:00Z'); // only trust obs from this date onward
+  // Resolved once, available to every tier (1/2/3) and passed through to
+  // _assembleFakeDealResult for the serp-price conversion there.
+  const fxRates = await getFxRates();
 
   // ── No-discount fast path ─────────────────────────────────────
   if (!was || !Number.isFinite(was) || was <= cur) {
@@ -773,10 +793,29 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
   const peers = (peerPrices || []).filter(n => Number.isFinite(n) && n > 0);
 
   // Valid history = only observations on/after Feb 25 2025
-  const validRows = (historyRows || []).filter(r => {
-    if (!r.observed_at) return false;
-    return new Date(r.observed_at) >= VALID_FROM && Number.isFinite(Number(r.price)) && Number(r.price) > 0;
-  });
+  //
+  // FIX (currency): historyRows/price_observations weren't currency-aware
+  // at all — same class of bug as decideDealBucket/peerPrices, just for
+  // the fake-deal verdict's own price-history comparison instead of the
+  // Best Deals candidate list. A single listing's history is normally one
+  // currency throughout, but this makes the comparison correct even when
+  // it isn't (a past extraction glitch, a currency-label flip on a page)
+  // instead of assuming it always is. Converts every historical price to
+  // the base listing's currency (curr) using TODAY's rates uniformly —
+  // deliberately not per-observation-date rates (getFxRates supports that
+  // for a future trend-chart feature, but for a single real/fake verdict
+  // check, one consistent yardstick across all rows is what actually
+  // matters here, not historical FX precision). Falls back to the raw
+  // price if a row has no currency on it or the currency's unknown.
+  const validRows = (historyRows || [])
+    .filter(r => {
+      if (!r.observed_at) return false;
+      return new Date(r.observed_at) >= VALID_FROM && Number.isFinite(Number(r.price)) && Number(r.price) > 0;
+    })
+    .map(r => {
+      const converted = convertSync(Number(r.price), r.currency, curr, fxRates);
+      return { ...r, price: converted != null ? converted : Number(r.price) };
+    });
   const validPrices = validRows.map(r => Number(r.price));
   const histCount   = validRows.length;
   const peerCount   = peers.length;
@@ -854,7 +893,7 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
       console.log(`[FakeDeal:T1] peers=${peerCount} peerMedian=${Math.round(peerMedian)} verdict=${verdictKey} score=${fakeDealScore}`);
       return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
         explanation, sourceUsed, refMedian, cleanPrices: peers, serpRefs: [], debugReasons,
-        histCount, peerCount, serpCount: 0, cur, was, curr });
+        histCount, peerCount, serpCount: 0, cur, was, curr, fxRates });
     }
   }
 
@@ -916,7 +955,7 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
       console.log(`[FakeDeal:T2] hist=${histCount} atWas=${atWasRows.length} legDays=${legitimacyDays} verdict=${verdictKey}`);
       return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
         explanation, sourceUsed, refMedian, cleanPrices: validPrices, serpRefs: [], debugReasons,
-        histCount, peerCount, serpCount: 0, cur, was, curr });
+        histCount, peerCount, serpCount: 0, cur, was, curr, fxRates });
     }
   }
 
@@ -941,7 +980,14 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
   }
 
   // Build combined price pool
-  const serpPrices     = serpRefs.map(r => r.price).filter(n => Number.isFinite(n) && n > 0);
+  // FIX (currency): serp results come back in whichever currency their gl
+  // market uses (see GL_CURRENCY in searchMarketPriceSerp) — for any
+  // non-GBP/EUR/ZAR currency that's USD, tagged on each ref. Convert to
+  // the base listing's currency (curr) before mixing into the stats pool,
+  // instead of comparing raw USD numbers against e.g. UGX history/peers.
+  const serpPrices      = serpRefs
+    .map(r => convertSync(r.price, r.currency, curr, fxRates))
+    .filter(n => Number.isFinite(n) && n > 0);
   const internalPrices = [...validPrices, ...peers];
   const allPrices      = [...internalPrices, ...serpPrices];
   const cleanPrices    = allPrices.filter(n => Number.isFinite(n) && n > 0);
@@ -1064,13 +1110,13 @@ Respond ONLY with JSON: { "verdict": "likely_fake"|"suspicious"|"likely_real"|"c
 
   return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
     explanation, sourceUsed, refMedian, cleanPrices, serpRefs, debugReasons,
-    histCount, peerCount, serpCount, cur, was, curr });
+    histCount, peerCount, serpCount, cur, was, curr, fxRates });
 }
 
 // ── Shared output assembler — keeps both tiers returning identical shape ──
 function _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
     explanation, sourceUsed, refMedian, cleanPrices, serpRefs, debugReasons,
-    histCount, peerCount, serpCount, cur, was, curr }) {
+    histCount, peerCount, serpCount, cur, was, curr, fxRates }) {
 
   const VERDICT_DISPLAY = {
     likely_fake:   '❌ Likely Fake',
@@ -1080,9 +1126,24 @@ function _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, c
     no_discount:   '— No Discount',
   };
 
+  // FIX (currency, display): same class of bug as the Best Deals card fix —
+  // r.price here is still the SerpAPI result's native currency (tagged via
+  // r.currency in searchMarketPriceSerp), never converted for display even
+  // though it's now converted for the stats math above. Convert here too,
+  // keep native price/currency alongside for reference.
   const topRefs = [...serpRefs]
     .sort((a,b) => a.price - b.price).slice(0, 3)
-    .map(r => ({ source: r.source, price: r.price, url: r.url, title: r.title, condition: r.condition }));
+    .map(r => {
+      const displayPrice = convertSync(r.price, r.currency, curr, fxRates);
+      return {
+        source: r.source,
+        price: displayPrice != null ? displayPrice : r.price,
+        currency: displayPrice != null ? curr : r.currency,
+        nativePrice: r.price,
+        nativeCurrency: r.currency,
+        url: r.url, title: r.title, condition: r.condition,
+      };
+    });
 
   return {
     verdictKey,
@@ -5016,7 +5077,7 @@ app.post("/v1/ai/fake-deal", async (req, res) => {
   let historyRows   = [];
   if (product?.id) {
     const { data: hist } = await supabase.from("price_observations")
-      .select("price, observed_at").eq("product_id", product.id)
+      .select("price, observed_at, currency").eq("product_id", product.id)
       .order("observed_at", { ascending: false }).limit(120);
     historyRows   = (hist || []).filter(r => Number.isFinite(Number(r.price)));
     historyPrices = historyRows.map(r => Number(r.price));
