@@ -4748,7 +4748,7 @@ app.post("/v1/observations", async (req, res) => {
 
       const dealsResult = await computeDealsForProduct({
         storeId: o.storeId, storeProductId: o.storeProductId,
-        baseTitle: o.titleNormalized || o.title || existingProduct?.title_key || existingProduct?.title || "", baseCurrency: o.currency,
+        baseTitle: o.titleNormalized || o.title || existingProduct?.title_key || existingProduct?.title || "", baseCurrency: o.currency || existingProduct?.currency || "USD",
         basePrice: null, // no price to rank cheaper-than — otherModels still populates
         limit: 10
       });
@@ -4857,7 +4857,7 @@ app.post("/v1/observations", async (req, res) => {
   }
 
   if (!dealsResult) {
-    dealsResult = await computeDealsForProduct({ storeId: o.storeId, storeProductId: o.storeProductId, baseTitle: o.titleNormalized || o.title || product.title_key || product.title || "", baseCurrency: o.currency, basePrice: o.price, limit: 10 });
+    dealsResult = await computeDealsForProduct({ storeId: o.storeId, storeProductId: o.storeProductId, baseTitle: o.titleNormalized || o.title || product.title_key || product.title || "", baseCurrency: o.currency || product?.currency || "USD", basePrice: o.price, limit: 10 });
     // Save to cache async — 2 hour TTL
     const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
     supabase.from("deals_cache").upsert(
