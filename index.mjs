@@ -61,6 +61,13 @@ setInterval(refreshFxRates, 12 * 60 * 60 * 1000);
 refreshCalibrationStats();
 setInterval(refreshCalibrationStats, 6 * 60 * 60 * 1000);
 
+// Store trust score — see refreshStoreTrustStats() for what this does.
+// Same cadence reasoning as calibration: verdicts get logged continuously
+// as people browse, so refreshing every 6h keeps the snapshot reasonably
+// current without hitting the DB on every single fake-deal check.
+refreshStoreTrustStats();
+setInterval(refreshStoreTrustStats, 6 * 60 * 60 * 1000);
+
 // In-memory cache keyed by date so repeated calls in one day don't hit
 // the DB each time. Cleared whenever refreshFxRates() writes new rows.
 let _fxCache = { date: null, rates: null };
@@ -827,6 +834,16 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
   const validRows = (historyRows || [])
     .filter(r => {
       if (!r.observed_at) return false;
+      // Exclude bootstrapHistoryIfNeeded's synthetic estimated_history rows.
+      // Tier 2 below exists specifically to answer "was wasPrice genuinely
+      // charged, for real, for 14+ days" — a fabricated interpolated point
+      // must never be allowed to answer that question, in either direction
+      // (it could wrongly validate a fake discount, or wrongly flag a real
+      // one, purely because a cold-start estimate happened to land nearby).
+      // histCount below also feeds evidence.historyCount, shown directly to
+      // the user as "how much data backs this verdict" — that number must
+      // reflect real observations only, not be inflated by filler rows.
+      if (r.source === 'estimated_history') return false;
       return new Date(r.observed_at) >= VALID_FROM && Number.isFinite(Number(r.price)) && Number(r.price) > 0;
     })
     .map(r => {
@@ -910,7 +927,7 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
       console.log(`[FakeDeal:T1] peers=${peerCount} peerMedian=${Math.round(peerMedian)} verdict=${verdictKey} score=${fakeDealScore}`);
       return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
         explanation, sourceUsed, refMedian, cleanPrices: peers, serpRefs: [], debugReasons,
-        histCount, peerCount, serpCount: 0, cur, was, curr, fxRates });
+        histCount, peerCount, serpCount: 0, cur, was, curr, fxRates, storeId, storeProductId });
     }
   }
 
@@ -972,7 +989,7 @@ async function analyseDeal({ title, currentPrice, wasPrice, currency, storeId, s
       console.log(`[FakeDeal:T2] hist=${histCount} atWas=${atWasRows.length} legDays=${legitimacyDays} verdict=${verdictKey}`);
       return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
         explanation, sourceUsed, refMedian, cleanPrices: validPrices, serpRefs: [], debugReasons,
-        histCount, peerCount, serpCount: 0, cur, was, curr, fxRates });
+        histCount, peerCount, serpCount: 0, cur, was, curr, fxRates, storeId, storeProductId });
     }
   }
 
@@ -1127,13 +1144,74 @@ Respond ONLY with JSON: { "verdict": "likely_fake"|"suspicious"|"likely_real"|"c
 
   return _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
     explanation, sourceUsed, refMedian, cleanPrices, serpRefs, debugReasons,
-    histCount, peerCount, serpCount, cur, was, curr, fxRates });
+    histCount, peerCount, serpCount, cur, was, curr, fxRates, storeId, storeProductId });
 }
 
 // ── Shared output assembler — keeps both tiers returning identical shape ──
+// ── Store trust score — closes the loop for fake-deal detection the same
+// way applyPredictionCalibration() closes it for predictions above.
+// Every verdict _assembleFakeDealResult produces gets logged to
+// fake_deal_logs; a periodic snapshot then aggregates each store's rate
+// of likely_fake/suspicious verdicts over a rolling 90-day window. A
+// store with a poor track record gets its FUTURE verdicts nudged toward
+// more skepticism — this is a prior, not a override: it shifts the score
+// a bounded amount, it never flips a verdict on its own, and it only
+// activates once a store has enough logged history to trust the number
+// (see STORE_TRUST_MIN_SAMPLES) so a brand-new or rarely-seen store is
+// judged purely on this one deal's own evidence, exactly as today.
+const STORE_TRUST_MIN_SAMPLES  = 8;
+const STORE_TRUST_WINDOW_DAYS  = 90;
+const STORE_TRUST_MAX_NUDGE    = 12; // fakeDealScore points — bounded so this can shift a verdict near a boundary but can't manufacture one from nothing
+let _storeTrustCache = { at: 0, data: null };
+
+function logFakeDealVerdict({ storeId, storeProductId, verdictKey, fakeDealScore, confidenceScore, sourceUsed, currentPrice, wasPrice, currency }) {
+  if (!storeId || !verdictKey || verdictKey === 'no_discount') return; // nothing to learn from "no discount" checks
+  supabase.from('fake_deal_logs').insert({
+    store: storeId, store_product_id: storeProductId || null,
+    verdict_key: verdictKey, fake_deal_score: Math.round(fakeDealScore ?? 0),
+    confidence_score: Math.round(confidenceScore ?? 0), source_used: sourceUsed || null,
+    current_price: Number.isFinite(currentPrice) ? currentPrice : null,
+    was_price: Number.isFinite(wasPrice) ? wasPrice : null,
+    currency: currency || 'USD',
+  }).then(() => {}).catch(e => console.warn('[storeTrust] log error:', e.message));
+}
+
+async function refreshStoreTrustStats() {
+  try {
+    const since = new Date(Date.now() - STORE_TRUST_WINDOW_DAYS * 86400000).toISOString();
+    const { data: rows, error } = await supabase
+      .from('fake_deal_logs')
+      .select('store, verdict_key')
+      .gte('created_at', since)
+      .limit(50000);
+    if (error) { console.warn('[storeTrust] fetch error:', error.message); return; }
+
+    const byStore = {};
+    for (const r of (rows || [])) (byStore[r.store] ||= []).push(r.verdict_key);
+
+    const stores = {};
+    for (const [store, verdicts] of Object.entries(byStore)) {
+      if (verdicts.length < STORE_TRUST_MIN_SAMPLES) continue; // not enough logged history yet — stays unrated
+      const flagged = verdicts.filter(v => v === 'likely_fake' || v === 'suspicious').length;
+      stores[store] = { fakeRate: flagged / verdicts.length, sampleSize: verdicts.length };
+    }
+
+    _storeTrustCache = { at: Date.now(), data: stores };
+    console.log(`[storeTrust] refreshed — ${Object.keys(stores).length} stores rated (min ${STORE_TRUST_MIN_SAMPLES} samples)`);
+  } catch (e) {
+    console.warn('[storeTrust] refresh error:', e.message);
+  }
+}
+
+// Synchronous getter, same pattern as getCalibrationSnapshot() — never
+// blocks a live fake-deal check on a DB round-trip.
+function getStoreTrust(storeId) {
+  return (_storeTrustCache.data || {})[storeId] || null;
+}
+
 function _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, confidenceStr,
     explanation, sourceUsed, refMedian, cleanPrices, serpRefs, debugReasons,
-    histCount, peerCount, serpCount, cur, was, curr, fxRates }) {
+    histCount, peerCount, serpCount, cur, was, curr, fxRates, storeId, storeProductId }) {
 
   const VERDICT_DISPLAY = {
     likely_fake:   '❌ Likely Fake',
@@ -1142,6 +1220,31 @@ function _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, c
     cannot_verify: '🤷 Cannot Verify',
     no_discount:   '— No Discount',
   };
+
+  // ── Store trust nudge ──────────────────────────────────────────
+  // Deliberately one-directional: a poor track record pushes the score
+  // toward more scrutiny, but a clean track record never pushes it
+  // toward more trust. That asymmetry is intentional — the cost of being
+  // slightly too skeptical of a trustworthy store is a smaller badge
+  // number; the cost of the reverse is a shopper trusting a fake
+  // discount because the maths said the store "usually" behaves. Only
+  // applies once refreshStoreTrustStats() has enough logged history for
+  // this store (see STORE_TRUST_MIN_SAMPLES) — otherwise this deal is
+  // judged purely on its own evidence, exactly as before this existed.
+  let storeTrust = null;
+  if (verdictKey !== 'no_discount' && storeId) {
+    const trust = getStoreTrust(storeId);
+    if (trust && trust.fakeRate > 0.25) {
+      const nudge = Math.round(STORE_TRUST_MAX_NUDGE * Math.min(1, trust.fakeRate));
+      fakeDealScore = Math.min(100, fakeDealScore + nudge);
+      storeTrust = { fakeRatePct: Math.round(trust.fakeRate * 100), sampleSize: trust.sampleSize, scoreNudge: nudge };
+      debugReasons = [...debugReasons, `store_trust_nudge:+${nudge}(fakeRate:${storeTrust.fakeRatePct}%,n:${trust.sampleSize})`];
+      explanation = `${explanation} This store has had ${storeTrust.fakeRatePct}% of its tracked discounts flagged as questionable over the last ${STORE_TRUST_WINDOW_DAYS} days (${trust.sampleSize} checks).`;
+    }
+  }
+
+  logFakeDealVerdict({ storeId, storeProductId, verdictKey, fakeDealScore, confidenceScore,
+    sourceUsed, currentPrice: cur, wasPrice: was, currency: curr });
 
   // FIX (currency, display): same class of bug as the Best Deals card fix —
   // r.price here is still the SerpAPI result's native currency (tagged via
@@ -1167,6 +1270,7 @@ function _assembleFakeDealResult({ verdictKey, fakeDealScore, confidenceScore, c
     fakeDealScore,
     confidenceScore,
     explanation,
+    storeTrust,
     stats: {
       refMedian,
       refP25: null, refP75: null, mad: null,
@@ -4976,8 +5080,16 @@ app.post("/v1/observations", async (req, res) => {
       { onConflict: "cache_key" }
     ).then(() => {}).catch(e => console.warn(`[deals-cache] write error: ${e.message}`));
   }
-  const { data: obsRows } = await supabase.from("price_observations").select("price,observed_at").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(120);
+  // `source` selected so nHist below can reflect REAL observations only —
+  // bootstrapHistoryIfNeeded's synthetic rows exist to smooth the display
+  // for cold-start products, but they must never count toward "we have
+  // enough real data to be confident" gating (applyShippingRules), or a
+  // product with 2 real + 10 fabricated points would look like it has
+  // plenty of history when it really doesn't.
+  const { data: obsRows } = await supabase.from("price_observations").select("price,observed_at,source").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(120);
   const prices = (obsRows||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
+  const realPrices = (obsRows||[]).filter(r => r.source !== 'estimated_history' && Number.isFinite(Number(r.price))).map(r => Number(r.price));
+  const realHistCount = realPrices.length;
   const stats  = computeStats(prices);
   const bestDealsObs = dealsResult.bestDeals || [];
 
@@ -4986,7 +5098,7 @@ app.post("/v1/observations", async (req, res) => {
   let fakeDeal = null;
   if (o.wasPrice && Number.isFinite(o.wasPrice) && o.wasPrice > o.price) {
     // peerPrices MUST use bestDeals only (not otherModels)
-    fakeDeal = heuristicDetect(o.price, o.wasPrice, o.currency, prices, bestDealsObs.map(d=>d.price).filter(Number.isFinite));
+    fakeDeal = heuristicDetect(o.price, o.wasPrice, o.currency, realPrices, bestDealsObs.map(d=>d.price).filter(Number.isFinite));
   }
 
   // Prediction — apply shipping rules, then log for evaluation
@@ -5000,7 +5112,7 @@ app.post("/v1/observations", async (req, res) => {
     peerPrices: bestDealsObs.map(d => d.price).filter(Number.isFinite),
   });
   const prediction = applyShippingRules(_rawPred, {
-    nHist: prices.length, nPeer: bestDealsObs.length,
+    nHist: realHistCount, nPeer: bestDealsObs.length,
     category: _predAttrs?.category || null,
   });
   if (_rawPred && !_rawPred.fromCache) {
@@ -5069,10 +5181,11 @@ app.post("/v1/observations", async (req, res) => {
         }));
 
         const dStats = computeStats(dPrices);
+        const dRealPrices = realPrices.map(conv).filter(Number.isFinite);
         const dAi    = heuristicRec(dPrice, dStats, prices.length, dBestDeals, o.displayCurrency);
         let dFakeDeal = null;
         if (dWasPrice && dWasPrice > dPrice) {
-          dFakeDeal = heuristicDetect(dPrice, dWasPrice, o.displayCurrency, dPrices, dBestDeals.map(d => d.price).filter(Number.isFinite));
+          dFakeDeal = heuristicDetect(dPrice, dWasPrice, o.displayCurrency, dRealPrices, dBestDeals.map(d => d.price).filter(Number.isFinite));
         }
         const dRawPred = await computePredictionV2({
           title: o.title || product.title || "",
@@ -5082,7 +5195,7 @@ app.post("/v1/observations", async (req, res) => {
           peerPrices: dBestDeals.map(d => d.price).filter(Number.isFinite),
         });
         const dPrediction = applyShippingRules(dRawPred, {
-          nHist: prices.length, nPeer: bestDealsObs.length,
+          nHist: realHistCount, nPeer: bestDealsObs.length,
           category: _predAttrs?.category || null,
         });
 
@@ -5114,7 +5227,7 @@ app.get("/v1/products/:storeId/:storeProductId", async (req, res) => {
   const { storeId, storeProductId } = req.params;
   const { data: product } = await supabase.from("products").select("*").eq("store_id", storeId).eq("store_product_id", storeProductId).maybeSingle();
   if (!product) return res.status(404).json({ error: "not_found" });
-  const { data: hist } = await supabase.from("price_observations").select("price,observed_at").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(90);
+  const { data: hist } = await supabase.from("price_observations").select("price,observed_at,source").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(90);
   const prices = (hist||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
   const stats  = computeStats(prices);
   const nativeCurrency = product.currency || "USD";
@@ -5206,8 +5319,10 @@ app.post("/v1/ai/recommend", async (req, res) => {
   const { data: product } = await supabase.from("products").select("*").eq("store_id", storeId).eq("store_product_id", storeProductId).maybeSingle();
   if (!product) return res.status(404).json({ ok: false, error: "not_found" });
 
-  const { data: hist } = await supabase.from("price_observations").select("price,observed_at").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(120);
-  const prices = (hist||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
+  // `source` selected to exclude bootstrapHistoryIfNeeded's synthetic rows
+  // from stats — see the identical comment on /v1/ai/chat's history query.
+  const { data: hist } = await supabase.from("price_observations").select("price,observed_at,source").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(120);
+  const prices = (hist||[]).filter(r => r.source !== 'estimated_history').map(r => Number(r.price)).filter(n => Number.isFinite(n));
   const stats  = computeStats(prices);
   const dealsR3 = await computeDealsForProduct({ storeId, storeProductId, baseTitle: product.title||"", baseCurrency: product.currency||"USD", basePrice: Number(product.last_price), limit: 10 });
   const peerPricesR3 = (dealsR3.bestDeals||[]).map(d=>d.price).filter(Number.isFinite);
@@ -5258,8 +5373,12 @@ app.post("/v1/ai/fake-deal", async (req, res) => {
   let historyPrices = [];
   let historyRows   = [];
   if (product?.id) {
+    // `source` added specifically so analyseDeal's Tier 2 "was this price
+    // genuinely held for 14+ days" check can exclude bootstrapHistoryIfNeeded's
+    // synthetic estimated_history rows — those are fabricated for cold-start
+    // display continuity and must never count as evidence a discount is real.
     const { data: hist } = await supabase.from("price_observations")
-      .select("price, observed_at, currency").eq("product_id", product.id)
+      .select("price, observed_at, currency, source").eq("product_id", product.id)
       .order("observed_at", { ascending: false }).limit(120);
     historyRows   = (hist || []).filter(r => Number.isFinite(Number(r.price)));
     historyPrices = historyRows.map(r => Number(r.price));
@@ -6598,9 +6717,16 @@ app.post("/v1/ai/chat", async (req, res) => {
   const { data: product } = await supabase.from("products").select("*").eq("store_id", storeId).eq("store_product_id", storeProductId).maybeSingle();
   if (!product) return res.status(404).json({ ok: false, error: "not_found" });
 
-  const { data: hist } = await supabase.from("price_observations").select("price,observed_at").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(120);
-  const prices = (hist||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
-  const stats  = computeStats(prices);
+  // `source` selected so factual claims ("all-time low: $X") and the
+  // fake-deal check below can be computed from REAL observations only —
+  // bootstrapHistoryIfNeeded's synthetic estimated_history rows exist to
+  // smooth cold-start display elsewhere, but chat states these numbers as
+  // literal facts, and a fabricated data point must never be presented
+  // that way, nor allowed to answer "was this ever really the price."
+  const { data: hist } = await supabase.from("price_observations").select("price,observed_at,source").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(120);
+  const prices     = (hist||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
+  const realPrices = (hist||[]).filter(r => r.source !== 'estimated_history' && Number.isFinite(Number(r.price))).map(r => Number(r.price));
+  const stats  = computeStats(realPrices);
   const currentPrice = Number(parsed.data.currentPrice ?? product.last_price);
   const currency = String(parsed.data.currency ?? product.currency ?? "USD");
   const dealsR5 = await computeDealsForProduct({ storeId, storeProductId, baseTitle: product.title||"", baseCurrency: currency, basePrice: currentPrice, limit: 10 });
@@ -6609,7 +6735,7 @@ app.post("/v1/ai/chat", async (req, res) => {
   // Heuristic fake deal for chat context (no AI call here — detector key is reserved)
   let fakeDealCtx = "";
   if (parsed.data.wasPrice) {
-    const fd = heuristicDetect(currentPrice, parsed.data.wasPrice, currency, prices, deals.map(d=>d.price).filter(Number.isFinite));
+    const fd = heuristicDetect(currentPrice, parsed.data.wasPrice, currency, realPrices, deals.map(d=>d.price).filter(Number.isFinite));
     if (fd) fakeDealCtx = `${fd.verdict} — ${fd.message}`;
   }
 
