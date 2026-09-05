@@ -47,11 +47,11 @@ async function refreshFxRates() {
     console.error("[fx] refreshFxRates failed:", e.message);
   }
 }
-// Run once on boot, then every 24h. If a boot-time fetch fails (network
+// Run once on boot, then every 12h. If a boot-time fetch fails (network
 // hiccup, provider down), the DB keeps yesterday's rates and getFxRates()
 // below falls back to the most recent date on file — never hard-fails.
 refreshFxRates();
-setInterval(refreshFxRates, 24 * 60 * 60 * 1000);
+setInterval(refreshFxRates, 12 * 60 * 60 * 1000);
 
 // In-memory cache keyed by date so repeated calls in one day don't hit
 // the DB each time. Cleared whenever refreshFxRates() writes new rows.
@@ -385,17 +385,26 @@ function moneyFmt(currency, price) {
 //  These run on every page load. AI only runs when user clicks.
 // ============================================================
 
-function heuristicRec(current, stats, historyCount, deals = []) {
+function heuristicRec(current, stats, historyCount, deals = [], currency = "USD") {
   // This function now only feeds chat fallback and internal logic — not displayed directly in UI
+  //
+  // FIX (currency): both the "less" amount and the min/max callouts below
+  // used to hardcode "USD" / pass `null` (which moneyFmt silently defaults
+  // to USD) regardless of what currency `current`/`stats` actually are in.
+  // Harmless while every price in the app was assumed-USD; wrong the
+  // moment a non-USD store or a display-currency override is in play —
+  // the number would already be correctly converted, but mislabeled.
+  // `currency` is now a required-in-spirit param, always the currency the
+  // caller's `current`/`stats`/`deals[].price` numbers are actually in.
   const cheaper = (deals || []).filter(d => Number.isFinite(d.price) && d.price < current * 0.98).sort((a, b) => a.price - b.price).slice(0, 3);
-  if (cheaper.length) return { action: "Cheaper elsewhere", text: `${cheaper[0].name} has it for ${moneyFmt(cheaper[0].currency || "USD", cheaper[0].price)} — ${moneyFmt("USD", current - cheaper[0].price)} less.`, confidence: 82, expectedPrice: cheaper[0].price, timeframe: "now", source: "heuristic" };
+  if (cheaper.length) return { action: "Cheaper elsewhere", text: `${cheaper[0].name} has it for ${moneyFmt(cheaper[0].currency || currency, cheaper[0].price)} — ${moneyFmt(currency, current - cheaper[0].price)} less.`, confidence: 82, expectedPrice: cheaper[0].price, timeframe: "now", source: "heuristic" };
   if (historyCount === 0) return { action: "New listing", text: "First time seeing this product. Check back after a few visits for trend data.", confidence: 50, source: "heuristic" };
   if (!stats) return { action: "Watching", text: "Still building price history.", confidence: 50, source: "heuristic" };
   const { min, max, avg } = stats;
   const pct = ((current - min) / ((max - min) || 1)) * 100;
   const conf = Math.min(90, 60 + Math.floor(Math.log2(historyCount + 1) * 7));
-  if (pct <= 15) return { action: "Good price", text: `Near its historical low of ${moneyFmt(null, min)}. Solid time to buy.`, confidence: conf, source: "heuristic" };
-  if (pct >= 85) return { action: "High right now", text: `Near its historical high of ${moneyFmt(null, max)}. Worth waiting for a dip.`, confidence: conf, source: "heuristic" };
+  if (pct <= 15) return { action: "Good price", text: `Near its historical low of ${moneyFmt(currency, min)}. Solid time to buy.`, confidence: conf, source: "heuristic" };
+  if (pct >= 85) return { action: "High right now", text: `Near its historical high of ${moneyFmt(currency, max)}. Worth waiting for a dip.`, confidence: conf, source: "heuristic" };
   if (current > avg * 1.08) return { action: "Above average", text: "Running a bit above its usual price. Often drops back.", confidence: Math.max(60, conf - 8), source: "heuristic" };
   return { action: "Fair price", text: "Around its typical price range. Fine to buy if you need it.", confidence: Math.max(55, conf - 12), source: "heuristic" };
 }
@@ -479,7 +488,7 @@ Respond ONLY as valid JSON, no markdown:
       if (p.action && p.text) return { ...p, source: "ai" };
     } catch {}
   }
-  return heuristicRec(currentPrice, stats, historyCount, deals);
+  return heuristicRec(currentPrice, stats, historyCount, deals, currency);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -4478,7 +4487,15 @@ const ObservationSchema = z.object({
   // being rejected before reaching storage.
   priceStatus: z.enum([
     "ok","hidden","unavailable","blocked","multiple_offers","not_shippable","unknown"
-  ]).optional().default("unknown")
+  ]).optional().default("unknown"),
+  // User's manual currency-override selection (globe icon in panel header).
+  // Optional 3-letter ISO code. When present and different from the page's
+  // native `currency`, the response includes a `display` block with every
+  // price-bearing field re-expressed in this currency — the native fields
+  // (top-level price/currency/stats/ai/fakeDeal/deals/otherModels/prediction)
+  // are ALWAYS still computed and returned in the page's real currency too,
+  // so DB writes and downstream native-only consumers are never affected.
+  displayCurrency: z.string().min(3).max(3).optional().nullable(),
 }).transform(o => ({
   storeId: o.storeId ?? o.store_id, storeProductId: o.storeProductId ?? o.store_product_id,
   canonicalUrl: o.canonicalUrl ?? o.canonical_url, pageUrl: o.pageUrl ?? o.page_url,
@@ -4486,7 +4503,8 @@ const ObservationSchema = z.object({
   imageUrl: o.imageUrl ?? o.image_url ?? null,
   price: o.price ?? null, currency: o.currency ?? "USD", source: o.source ?? "extension",
   host: o.host ?? null, wasPrice: o.wasPrice ?? null,
-  priceSource: o.priceSource ?? "unknown", priceStatus: o.priceStatus ?? "unknown"
+  priceSource: o.priceSource ?? "unknown", priceStatus: o.priceStatus ?? "unknown",
+  displayCurrency: o.displayCurrency ? String(o.displayCurrency).toUpperCase() : null,
 }));
 
 const AiChatSchema = z.object({
@@ -4514,6 +4532,30 @@ app.get("/health", (_req, res) => res.json({
   queue: { pending: [...jobStore.values()].filter(j => j.status === "pending").length,
            done: [...jobStore.values()].filter(j => j.status === "done").length }
 }));
+
+// Supported currency codes for the extension's manual override picker.
+// Sourced live from fx_rates_daily rather than hardcoded, so the list the
+// user picks from can never drift out of sync with what convertSync()
+// actually has rates for (a hardcoded list could silently list a code
+// the backend then can't convert, which convertSync already handles
+// gracefully by returning null — but better the picker just never offers
+// it). Cached in-memory for 1h since the code list itself barely ever
+// changes (only rate VALUES refresh every 12h, handled separately).
+let _fxCurrencyListCache = { at: 0, codes: null };
+app.get("/v1/fx/currencies", async (_req, res) => {
+  try {
+    if (_fxCurrencyListCache.codes && Date.now() - _fxCurrencyListCache.at < 60 * 60 * 1000) {
+      return res.json({ ok: true, codes: _fxCurrencyListCache.codes, attribution: FX_ATTRIBUTION });
+    }
+    const rates = await getFxRates();
+    const codes = Object.keys(rates).sort();
+    if (!codes.length) return res.status(503).json({ ok: false, error: "fx_rates_unavailable" });
+    _fxCurrencyListCache = { at: Date.now(), codes };
+    res.json({ ok: true, codes, attribution: FX_ATTRIBUTION });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // Extractor rules
 app.get("/v1/extractor", async (req, res) => {
@@ -4932,7 +4974,7 @@ app.post("/v1/observations", async (req, res) => {
   const bestDealsObs = dealsResult.bestDeals || [];
 
   // Heuristic only — instant, no API
-  const ai = heuristicRec(o.price, stats, prices.length, bestDealsObs);
+  const ai = heuristicRec(o.price, stats, prices.length, bestDealsObs, o.currency);
   let fakeDeal = null;
   if (o.wasPrice && Number.isFinite(o.wasPrice) && o.wasPrice > o.price) {
     // peerPrices MUST use bestDeals only (not otherModels)
@@ -4979,7 +5021,84 @@ app.post("/v1/observations", async (req, res) => {
     peerPrices:     bestDealsObs.map(d => d.price).filter(Number.isFinite),
   }).catch(e => console.warn('[bootstrap] silent fail:', e.message));
 
-  res.json({ ok: true, productId: product.id, historyCount: prices.length, stats, ai, fakeDeal, deals: bestDealsObs.slice(0,5), otherModels: (dealsResult.otherModels||[]).slice(0,4), prediction });
+  // ── Display-currency override (manual globe-icon selection) ────────────
+  // Everything above is computed and will be persisted/cached in the
+  // page's REAL currency (o.currency) — untouched by this block. If the
+  // user has manually picked a different display currency, we do a
+  // SECOND, purely-in-memory pass: convert the same already-fetched
+  // inputs (prices, obsRows, bestDealsObs) into that currency and re-run
+  // the exact same pure heuristic/prediction functions on the converted
+  // numbers. This matters because heuristicRec/heuristicDetect/
+  // computePredictionV2 bake formatted money straight into their `.text`/
+  // `.message` strings (e.g. "Near its historical low of $450.00") — you
+  // can't fix a mislabeled currency after the fact by relabeling a
+  // finished sentence, so the conversion has to happen on the INPUTS,
+  // before those sentences are generated. No extra DB/network calls:
+  // fxRates was already fetched inside analyseDeal/getFxRates's cache,
+  // and everything else here is pure computation on data already in hand.
+  let display = null;
+  if (o.displayCurrency && o.displayCurrency !== String(o.currency).toUpperCase()) {
+    try {
+      const fxRatesDisp = await getFxRates();
+      const conv = (v) => v == null ? null : convertSync(Number(v), o.currency, o.displayCurrency, fxRatesDisp);
+      const dPrice    = conv(o.price);
+      const dWasPrice = o.wasPrice ? conv(o.wasPrice) : null;
+
+      if (dPrice != null) {
+        const dPrices   = prices.map(conv).filter(Number.isFinite);
+        const dObsRows  = (obsRows || [])
+          .map(r => ({ ...r, price: conv(Number(r.price)) }))
+          .filter(r => Number.isFinite(r.price));
+        const dBestDeals = bestDealsObs.map(d => ({
+          ...d, price: conv(d.price), currency: o.displayCurrency,
+          nativePrice: d.price, nativeCurrency: d.currency || o.currency,
+        })).filter(d => Number.isFinite(d.price));
+        const dOtherModels = (dealsResult.otherModels || []).slice(0, 4).map(m => ({
+          ...m,
+          price: m.price != null ? conv(m.price) : null,
+          currency: m.price != null ? o.displayCurrency : m.currency,
+          nativePrice: m.price ?? null, nativeCurrency: m.currency || o.currency,
+        }));
+
+        const dStats = computeStats(dPrices);
+        const dAi    = heuristicRec(dPrice, dStats, prices.length, dBestDeals, o.displayCurrency);
+        let dFakeDeal = null;
+        if (dWasPrice && dWasPrice > dPrice) {
+          dFakeDeal = heuristicDetect(dPrice, dWasPrice, o.displayCurrency, dPrices, dBestDeals.map(d => d.price).filter(Number.isFinite));
+        }
+        const dRawPred = await computePredictionV2({
+          title: o.title || product.title || "",
+          currentPrice: dPrice, currency: o.displayCurrency,
+          storeId: o.storeId, storeProductId: o.storeProductId,
+          historyRows: dObsRows, historyPrices: dPrices,
+          peerPrices: dBestDeals.map(d => d.price).filter(Number.isFinite),
+        });
+        const dPrediction = applyShippingRules(dRawPred, {
+          nHist: prices.length, nPeer: bestDealsObs.length,
+          category: _predAttrs?.category || null,
+        });
+
+        display = {
+          currency: o.displayCurrency, price: dPrice,
+          nativeCurrency: o.currency, nativePrice: o.price,
+          stats: dStats, ai: dAi, fakeDeal: dFakeDeal,
+          deals: dBestDeals.slice(0, 5), otherModels: dOtherModels,
+          prediction: dPrediction,
+        };
+      } else {
+        console.warn(`[display-currency] unknown currency code "${o.displayCurrency}" or "${o.currency}" — skipping override, native response only`);
+      }
+    } catch (e) {
+      console.warn("[display-currency] conversion failed, falling back to native:", e.message);
+    }
+  }
+
+  res.json({
+    ok: true, productId: product.id, historyCount: prices.length,
+    currency: o.currency, price: o.price,
+    stats, ai, fakeDeal, deals: bestDealsObs.slice(0,5), otherModels: (dealsResult.otherModels||[]).slice(0,4), prediction,
+    display,
+  });
 });
 
 // ── Product lookup — heuristic only
@@ -4990,16 +5109,53 @@ app.get("/v1/products/:storeId/:storeProductId", async (req, res) => {
   const { data: hist } = await supabase.from("price_observations").select("price,observed_at").eq("product_id", product.id).order("observed_at", { ascending: false }).limit(90);
   const prices = (hist||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
   const stats  = computeStats(prices);
-  const dealsR2 = await computeDealsForProduct({ storeId, storeProductId, baseTitle: product.title||"", baseCurrency: product.currency||"USD", basePrice: Number(product.last_price), limit: 10 });
-  const ai = heuristicRec(Number(product.last_price), stats, prices.length, dealsR2.bestDeals||[]);
+  const nativeCurrency = product.currency || "USD";
+  const dealsR2 = await computeDealsForProduct({ storeId, storeProductId, baseTitle: product.title||"", baseCurrency: nativeCurrency, basePrice: Number(product.last_price), limit: 10 });
+  const ai = heuristicRec(Number(product.last_price), stats, prices.length, dealsR2.bestDeals||[], nativeCurrency);
   const prediction = await computePredictionV2({
     title: product.title || "",
-    currentPrice: Number(product.last_price), currency: product.currency || "USD",
+    currentPrice: Number(product.last_price), currency: nativeCurrency,
     storeId, storeProductId,
     historyPrices: prices,
     peerPrices: (dealsR2.bestDeals||[]).map(d=>d.price).filter(Number.isFinite),
   });
-  res.json({ ok: true, product, history: hist, stats, ai, deals: dealsR2.bestDeals||[], otherModels: dealsR2.otherModels||[], prediction });
+
+  // ── Display-currency override — same contract as /v1/observations ──
+  // The History tab in the extension renders `history` directly, so that
+  // array specifically needs converting here too (not just stats/ai),
+  // unlike /v1/observations where history never leaves the server as raw
+  // rows. Everything else follows the identical "convert inputs, re-run
+  // the same pure functions" pattern — see the long comment in
+  // /v1/observations for why post-hoc string patching doesn't work.
+  const requestedDisplay = req.query.displayCurrency ? String(req.query.displayCurrency).toUpperCase() : null;
+  let display = null;
+  if (requestedDisplay && requestedDisplay !== nativeCurrency.toUpperCase()) {
+    try {
+      const fxRatesDisp = await getFxRates();
+      const conv = (v) => v == null ? null : convertSync(Number(v), nativeCurrency, requestedDisplay, fxRatesDisp);
+      const dPrice = conv(Number(product.last_price));
+      if (dPrice != null) {
+        const dHistory = (hist||[])
+          .map(r => ({ ...r, price: conv(Number(r.price)) }))
+          .filter(r => Number.isFinite(r.price));
+        const dPrices = dHistory.map(r => r.price);
+        const dStats  = computeStats(dPrices);
+        const dDeals  = (dealsR2.bestDeals||[]).map(d => ({ ...d, price: conv(d.price), currency: requestedDisplay, nativePrice: d.price, nativeCurrency: d.currency||nativeCurrency })).filter(d => Number.isFinite(d.price));
+        const dOtherModels = (dealsR2.otherModels||[]).map(m => ({ ...m, price: m.price!=null?conv(m.price):null, currency: m.price!=null?requestedDisplay:m.currency, nativePrice: m.price??null, nativeCurrency: m.currency||nativeCurrency }));
+        const dAi = heuristicRec(dPrice, dStats, prices.length, dDeals, requestedDisplay);
+        const dRawPred = await computePredictionV2({
+          title: product.title || "", currentPrice: dPrice, currency: requestedDisplay,
+          storeId, storeProductId, historyPrices: dPrices, peerPrices: dDeals.map(d=>d.price).filter(Number.isFinite),
+        });
+        display = { currency: requestedDisplay, price: dPrice, nativeCurrency, nativePrice: Number(product.last_price),
+          history: dHistory, stats: dStats, ai: dAi, deals: dDeals, otherModels: dOtherModels, prediction: dRawPred };
+      }
+    } catch (e) {
+      console.warn("[products] display-currency conversion failed, returning native:", e.message);
+    }
+  }
+
+  res.json({ ok: true, product, history: hist, stats, ai, deals: dealsR2.bestDeals||[], otherModels: dealsR2.otherModels||[], prediction, display });
 
   // Bootstrap history if product is new (async — fires after response sent)
   bootstrapHistoryIfNeeded({
@@ -5208,14 +5364,45 @@ app.get("/v1/compare/:storeId/:storeProductId", async (req, res) => {
       }
     }
 
-    const bestPage  = result.bestDeals.slice(offset, offset + limit);
-    const otherPage = result.otherModels.slice(otherOffset, otherOffset + otherLimit);
+    let bestPage  = result.bestDeals.slice(offset, offset + limit);
+    let otherPage = result.otherModels.slice(otherOffset, otherOffset + otherLimit);
     const hasMore      = offset + limit < result.bestDeals.length;
     const otherHasMore = otherOffset + otherLimit < result.otherModels.length;
 
+    // ── Display-currency override — same contract as /v1/observations ──
+    // computeDealsForProduct already normalized every price here to
+    // baseCurrency (fixes the earlier cross-store comparison bug). This
+    // is a second, purely additive conversion step for the user's manual
+    // display selection — never touches baseCurrency/basePrice, which
+    // stay the page's real currency so caching/matching upstream is
+    // unaffected. Prices are pre-converted numbers, not baked into
+    // strings here, so a straight per-item conversion is safe (unlike
+    // heuristicRec/heuristicDetect's generated text elsewhere).
+    const requestedDisplay = req.query.displayCurrency ? String(req.query.displayCurrency).toUpperCase() : null;
+    let displayBase = null;
+    let baseDisplayPrice = null;
+    if (requestedDisplay && requestedDisplay !== String(baseCurrency).toUpperCase()) {
+      try {
+        const fxRatesDisp = await getFxRates();
+        const conv = (v) => v == null ? null : convertSync(Number(v), baseCurrency, requestedDisplay, fxRatesDisp);
+        baseDisplayPrice = conv(basePrice);
+        bestPage  = bestPage.map(d => ({
+          ...d, price: conv(d.price), currency: d.price != null ? requestedDisplay : d.currency,
+          nativePrice: d.price ?? null, nativeCurrency: d.currency || baseCurrency,
+        }));
+        otherPage = otherPage.map(m => ({
+          ...m, price: m.price != null ? conv(m.price) : null, currency: m.price != null ? requestedDisplay : m.currency,
+          nativePrice: m.price ?? null, nativeCurrency: m.currency || baseCurrency,
+        }));
+        displayBase = { price: baseDisplayPrice, currency: requestedDisplay, nativePrice: basePrice, nativeCurrency: baseCurrency };
+      } catch (e) {
+        console.warn("[compare] display-currency conversion failed, returning native:", e.message);
+      }
+    }
+
     res.json({
       ok: true,
-      base: { storeId, storeProductId, title: baseTitle, price: basePrice, currency: baseCurrency },
+      base: { storeId, storeProductId, title: baseTitle, price: basePrice, currency: baseCurrency, display: displayBase },
       deals:            bestPage,   // bestDeals (backwards-compat key)
       bestDeals:        bestPage,
       otherModels:      otherPage,
@@ -6486,7 +6673,7 @@ Use this knowledge when giving BUY/WAIT advice.
 
   // Heuristic chat fallback — always returns something useful
   const m = message.toLowerCase();
-  const ai = heuristicRec(currentPrice, stats, prices.length, deals);
+  const ai = heuristicRec(currentPrice, stats, prices.length, deals, currency);
   let fallback;
   if (m.match(/^(hey|hi|hello|sup|yo)\b/)) fallback = `Hey! I'm Atheon. You're looking at **${product.title}** — currently ${moneyFmt(currency, currentPrice)}. Ask me anything.`;
   else if (m.includes("who are you")||m.includes("about you")) fallback = `I'm Atheon — a price tracking assistant in your browser. I watch prices, spot fake deals, and find cheaper options. What do you need?`;
