@@ -5110,7 +5110,25 @@ app.get("/v1/products/:storeId/:storeProductId", async (req, res) => {
   const prices = (hist||[]).map(r => Number(r.price)).filter(n => Number.isFinite(n));
   const stats  = computeStats(prices);
   const nativeCurrency = product.currency || "USD";
-  const dealsR2 = await computeDealsForProduct({ storeId, storeProductId, baseTitle: product.title||"", baseCurrency: nativeCurrency, basePrice: Number(product.last_price), limit: 10 });
+  // Same deterministic cache key/lookup as /v1/observations — this route
+  // used to call computeDealsForProduct unconditionally, meaning refetching
+  // this endpoint (e.g. History tab refresh after a display-currency
+  // switch) could return a genuinely different peer set than the one the
+  // verdict shown on screen was just computed from, since peer-matching
+  // isn't perfectly deterministic run-to-run. Reusing the exact same cache
+  // key here means both routes converge on the same cached snapshot for
+  // the same price, closing that gap entirely.
+  const dealsCacheKeyP = `deals:${storeId}:${storeProductId}:${Math.round(Number(product.last_price) * 100)}`;
+  let dealsR2 = null;
+  try {
+    const { data: cachedP } = await supabase.from("deals_cache").select("payload, expires_at").eq("cache_key", dealsCacheKeyP).maybeSingle();
+    if (cachedP && new Date(cachedP.expires_at) > new Date()) dealsR2 = cachedP.payload;
+  } catch (e) { console.warn(`[deals-cache] /v1/products read error: ${e.message}`); }
+  if (!dealsR2) {
+    dealsR2 = await computeDealsForProduct({ storeId, storeProductId, baseTitle: product.title||"", baseCurrency: nativeCurrency, basePrice: Number(product.last_price), limit: 10 });
+    const expiresAtP = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    supabase.from("deals_cache").upsert({ cache_key: dealsCacheKeyP, payload: dealsR2, expires_at: expiresAtP }, { onConflict: "cache_key" }).then(() => {}).catch(() => {});
+  }
   const ai = heuristicRec(Number(product.last_price), stats, prices.length, dealsR2.bestDeals||[], nativeCurrency);
   const prediction = await computePredictionV2({
     title: product.title || "",
