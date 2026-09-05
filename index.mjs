@@ -53,6 +53,14 @@ async function refreshFxRates() {
 refreshFxRates();
 setInterval(refreshFxRates, 12 * 60 * 60 * 1000);
 
+// Calibration snapshot — see refreshCalibrationStats() for what this closes
+// the loop on. The evaluator (runPredictionEvaluator) only runs once/day,
+// so this doesn't need to be more frequent than that, but refreshing every
+// 6h costs nothing and means a mid-day evaluator backfill (e.g. after a
+// deploy) shows up in live predictions the same day rather than tomorrow.
+refreshCalibrationStats();
+setInterval(refreshCalibrationStats, 6 * 60 * 60 * 1000);
+
 // In-memory cache keyed by date so repeated calls in one day don't hit
 // the DB each time. Cleared whenever refreshFxRates() writes new rows.
 let _fxCache = { date: null, rates: null };
@@ -6001,7 +6009,14 @@ function combineSignals({ cur, fmt, signals, holiday, peers, nHist, nPeer }) {
 
 // ── E) Format for UI card ──────────────────────────────────────
 function formatPredictionForUI(pred, fmt) {
-  const confLabel = pred.dataConfidenceScore >= 70 ? 'High' : pred.dataConfidenceScore >= 40 ? 'Medium' : 'Low';
+  // Was dataConfidenceScore alone (data quantity only) — now takes the
+  // lower of data quantity and forecastConfidenceScore, so a calibration
+  // cap from applyPredictionCalibration() (see computePredictionV2) is
+  // actually visible here instead of only affecting numeric fields
+  // nothing renders. "High" now requires both plenty of history AND a
+  // forecast track record the evaluator hasn't disproven.
+  const confScore  = Math.min(pred.dataConfidenceScore, pred.forecastConfidenceScore ?? pred.dataConfidenceScore);
+  const confLabel = confScore >= 70 ? 'High' : confScore >= 40 ? 'Medium' : 'Low';
   const trendLabel = { 'falling fast':'Falling Fast','falling':'Falling','rising fast':'Rising Fast','rising':'Rising','stable':'Stable','unknown':'Unknown' }[pred.trendDirection] || pred.trendDirection;
   return {
     verdict: pred.verdict,
@@ -6050,8 +6065,62 @@ async function computePredictionV2({ title, currentPrice, currency, storeId, sto
         trendDir: 'unknown', timeFeatures: tf };
   if (!signals.timeFeatures) signals.timeFeatures = tf;
 
+// Applies the measured-outcomes calibration snapshot to one prediction's
+// raw signals. Two independent corrections:
+//  1. dropProbability30d is blended toward the MEASURED drop rate for
+//     whatever probability bucket it falls into — e.g. if "60-80%"
+//     predictions have only actually dropped 45% of the time over the
+//     last N evaluated outcomes, a fresh 70% raw estimate gets pulled
+//     down toward that reality rather than reported at face value.
+//  2. confidence/forecastConfidenceScore get an upper CEILING equal to
+//     the measured decision accuracy for this category (or overall, if
+//     the category doesn't have enough evaluated history yet) — this can
+//     only pull confidence DOWN, never boost it, mirroring the trust
+//     report's own "do not claim more than X% accuracy" rule, just
+//     enforced on the live number instead of only printed in an admin
+//     report after the fact.
+// Both corrections are weighted/gated by sample size (see the CALIB_MIN_*
+// constants above getCalibrationSnapshot) — with little or no evaluated
+// history yet, this function changes nothing, exactly as the app has
+// always behaved.
+function applyPredictionCalibration(combined, category) {
+  const snap = getCalibrationSnapshot();
+  const notes = {};
+
+  const bucketKey   = assignCalibrationBucket(combined.dropProbability30d);
+  const bucketStats = bucketKey ? snap.buckets[bucketKey] : null;
+  if (bucketStats) {
+    // Full trust only once a bucket has 3x the minimum sample size —
+    // between the minimum and that point, blend proportionally so a
+    // freshly-qualifying bucket (just over CALIB_MIN_BUCKET_SAMPLES)
+    // doesn't suddenly override the formula wholesale on thin evidence.
+    const weight  = Math.min(1, bucketStats.sampleSize / (CALIB_MIN_BUCKET_SAMPLES * 3));
+    const blended = (combined.dropProbability30d * (1 - weight)) + (bucketStats.measuredDropRate * weight);
+    notes.dropProbabilityRaw        = combined.dropProbability30d;
+    notes.dropProbabilitySampleSize = bucketStats.sampleSize;
+    combined.dropProbability30d = Math.max(0, Math.min(0.95, Math.round(blended * 100) / 100));
+  }
+
+  const trackRecord = snap.categories[category] || snap.overall;
+  if (trackRecord) {
+    const measuredPct = Math.round(trackRecord.accuracy * 100);
+    if (combined.confidence > measuredPct) {
+      notes.confidenceRaw       = combined.confidence;
+      notes.confidenceCappedBy  = snap.categories[category] ? 'category' : 'overall';
+      notes.confidenceSampleSize = trackRecord.sampleSize;
+      combined.confidence = measuredPct;
+    }
+    if (combined.forecastConfidenceScore > measuredPct) {
+      combined.forecastConfidenceScore = measuredPct;
+    }
+  }
+
+  if (Object.keys(notes).length) combined.calibration = notes;
+  return combined;
+}
+
   const holiday  = holidayImpact(storeId, cat, hCtx);
-  const combined = combineSignals({ cur, fmt, signals, holiday, peers, nHist, nPeer });
+  const combined = applyPredictionCalibration(combineSignals({ cur, fmt, signals, holiday, peers, nHist, nPeer }), cat);
   const ui       = formatPredictionForUI(combined, fmt);
 
   const allMarket   = [cur, ...peers].filter(n => Number.isFinite(n) && n > 0);
@@ -6086,8 +6155,15 @@ async function computePredictionV2({ title, currentPrice, currency, storeId, sto
   }[combined.trendDirection] || null;
 
   // ── Confidence label ──
-  const confLabel = combined.dataConfidenceScore >= 70 ? 'High'
-    : combined.dataConfidenceScore >= 40 ? 'Medium' : 'Low';
+  // Was dataConfidenceScore alone — see the identical fix + comment in
+  // formatPredictionForUI() above for why this now factors in the
+  // (possibly calibration-capped) forecast confidence score too. This is
+  // the label that actually renders in the extension's prediction card,
+  // so this is the one that matters most for the calibration loop to be
+  // visible rather than just numerically-present-but-unseen.
+  const cardConfScore = Math.min(combined.dataConfidenceScore, combined.forecastConfidenceScore);
+  const confLabel = cardConfScore >= 70 ? 'High'
+    : cardConfScore >= 40 ? 'Medium' : 'Low';
 
   // ── Target price label — be precise about what the number means ──
   // targetBuyPrice = realistic near-term buy target (peer median or holiday floor)
@@ -6220,6 +6296,12 @@ async function computePredictionV2({ title, currentPrice, currency, storeId, sto
       usedTimestamps: tf.reliable,
       usedPeers:      nPeer > 0,
       usedGemini:     false,
+      // Present only when applyPredictionCalibration() actually adjusted
+      // something — absent entirely means either no calibration data has
+      // accumulated yet for this bucket/category, or the raw formula
+      // already matched measured reality closely enough to need no
+      // correction. See refreshCalibrationStats() for sample-size gates.
+      calibration:    combined.calibration || null,
     },
     // ── card: clean display object — frontend renders this, skipping null fields ──
     card,
@@ -6840,6 +6922,90 @@ function assignCalibrationBucket(prob) {
   if (pct <= 60)  return '41-60';
   if (pct <= 80)  return '61-80';
   return '81-100';
+}
+
+// ── PART 1.5: Close the loop — read measured outcomes back into live predictions ──
+// Everything above (logPrediction / runPredictionEvaluator) measures how
+// accurate past predictions actually were, but until now nothing ever read
+// that data back — it only ever fed an admin-facing trust report. This
+// section is the missing link: a periodically-refreshed snapshot of
+// measured accuracy, consulted by computePredictionV2 (to correct
+// dropProbability30d toward what actually happened historically for that
+// probability bucket) and applyShippingRules (to cap confidence so it
+// can't overstate accuracy the evaluator has since disproven).
+//
+// Minimum sample sizes exist so a brand-new bucket/category with 2-3
+// evaluated outcomes can't wildly swing live predictions on noise — those
+// thresholds are the difference between "calibration" and "overfitting to
+// whatever happened to be measured this week." Below the threshold, the
+// function simply reports insufficient data and the raw formula is used
+// unmodified, exactly as it always has been.
+const CALIB_MIN_BUCKET_SAMPLES   = 20;
+const CALIB_MIN_OVERALL_SAMPLES  = 30;
+const CALIB_MIN_CATEGORY_SAMPLES = 25;
+let _calibCache = { at: 0, data: null };
+
+async function refreshCalibrationStats() {
+  try {
+    // Pull every evaluated outcome joined with its logged prediction's
+    // category — Supabase's embedded-resource syntax follows the FK on
+    // prediction_outcomes.prediction_log_id automatically.
+    const { data: rows, error } = await supabase
+      .from('prediction_outcomes')
+      .select('decision_correct, did_drop_meaningfully, calibration_bucket, prediction_logs(category)')
+      .limit(20000); // evaluator runs once/day in small batches — this is generous headroom, not a real cap in practice
+    if (error) { console.warn('[calib] fetch error:', error.message); return; }
+    if (!rows || !rows.length) { _calibCache = { at: Date.now(), data: { overall: null, buckets: {}, categories: {} } }; return; }
+
+    // Overall decision accuracy
+    const decided = rows.filter(r => r.decision_correct !== null);
+    const overall = decided.length >= CALIB_MIN_OVERALL_SAMPLES
+      ? { accuracy: decided.filter(r => r.decision_correct).length / decided.length, sampleSize: decided.length }
+      : null;
+
+    // Per-bucket measured drop rate (what dropProbability30d should have said)
+    const buckets = {};
+    for (const bucket of ['0-20','21-40','41-60','61-80','81-100']) {
+      const inBucket = rows.filter(r => r.calibration_bucket === bucket && r.did_drop_meaningfully !== null);
+      if (inBucket.length >= CALIB_MIN_BUCKET_SAMPLES) {
+        buckets[bucket] = {
+          measuredDropRate: inBucket.filter(r => r.did_drop_meaningfully).length / inBucket.length,
+          sampleSize: inBucket.length,
+        };
+      }
+    }
+
+    // Per-category decision accuracy
+    const categories = {};
+    const byCategory = {};
+    for (const r of decided) {
+      const cat = r.prediction_logs?.category;
+      if (!cat) continue;
+      (byCategory[cat] ||= []).push(r);
+    }
+    for (const [cat, catRows] of Object.entries(byCategory)) {
+      if (catRows.length >= CALIB_MIN_CATEGORY_SAMPLES) {
+        categories[cat] = {
+          accuracy: catRows.filter(r => r.decision_correct).length / catRows.length,
+          sampleSize: catRows.length,
+        };
+      }
+    }
+
+    _calibCache = { at: Date.now(), data: { overall, buckets, categories } };
+    console.log(`[calib] refreshed — overall:${overall ? Math.round(overall.accuracy*100)+'% ('+overall.sampleSize+')' : 'insufficient data'}, buckets:${Object.keys(buckets).length}/5 calibrated, categories:${Object.keys(categories).length} calibrated`);
+  } catch (e) {
+    console.warn('[calib] refresh error:', e.message);
+  }
+}
+
+// Synchronous getter — always reads the last successfully-fetched snapshot.
+// Never blocks a live prediction request on a DB round-trip; if the cache
+// hasn't loaded yet (fresh boot) or the refresh failed, callers get back
+// nulls/empty objects and simply skip calibration for that request —
+// identical to how the app has always behaved, just without the correction.
+function getCalibrationSnapshot() {
+  return _calibCache.data || { overall: null, buckets: {}, categories: {} };
 }
 
 // ── PART 2: Log a prediction ───────────────────────────────────
